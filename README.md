@@ -1,4 +1,7 @@
 # Pixel to Gaussian: Ultra-Fast Continuous Super-Resolution with 2D Gaussian Modeling
+
+### 🎉 Accepted by ICLR 2026 🎉
+
 > **Pixel to Gaussian: Ultra-Fast Continuous Super-Resolution with 2D Gaussian Modeling**<br>
 Long Peng<sup>1,3</sup>†, Anran Wu<sup>1,2</sup>†, Wenbo Li<sup>3</sup>*, Peizhe Xia<sup>1</sup>, Xueyuan Dai<sup>4</sup>, Xinjie Zhang<sup>5</sup>, Xin Di<sup>1</sup>, Haoze Sun<sup>6</sup>, Renjing Pei<sup>3</sup>, Yang Wang<sup>1,4*</sup>, Yang Cao<sup>1</sup>, Zheng-Jun Zha<sup>1</sup>. † Equal Contribution. * Corresponding Authors.
 
@@ -11,6 +14,7 @@ Long Peng<sup>1,3</sup>†, Anran Wu<sup>1,2</sup>†, Wenbo Li<sup>3</sup>*, Pe
 
 
 ## :rocket:  :rocket:  :rocket: **News**
+- [x]  **Our paper has been accepted by ICLR 2026!**
 - [x]  **Arxiv Version has been released.**
 - [x]  **Test code has been released.**
 - [x]  **The pretrained model has been released.**
