@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Environment
+.env
+*.egg
+
+# Data & checkpoints
+data/
+save/
+*.pth
+*.pt
+models/weights/
+
+# Job outputs
+jobs/*.stderr
+jobs/*.stdout
+
+# wandb
+wandb/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db

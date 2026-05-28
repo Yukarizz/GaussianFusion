@@ -173,7 +173,7 @@ class Encoder(nn.Module):
 
 
 @register('edsr-baseline')
-def make_encoder_baseline(n_resblocks=16, n_feats=64, res_scale=1, scale=2, no_upsampling=True, rgb_range=1, n_class=100):
+def make_encoder_baseline(n_resblocks=16, n_feats=64, res_scale=1, scale=2, no_upsampling=True, rgb_range=1, n_colors=3, n_class=100, pretrained_path=None):
     url = {
         'r16f64x2': 'models/weights/edsr_baseline_x2-1bc95232.pt',
         'r16f64x3': 'models/weights/edsr_baseline_x3-abf2a44e.pt',
@@ -191,11 +191,11 @@ def make_encoder_baseline(n_resblocks=16, n_feats=64, res_scale=1, scale=2, no_u
     args.n_resblocks = n_resblocks
     args.n_feats = n_feats
     args.res_scale = res_scale
-    args.scale = [scale]
+    args.scale = [scale] if not isinstance(scale, list) else scale
     args.no_upsampling = no_upsampling
     args.rgb_range = rgb_range
-    args.n_colors = 3
-    args.pretrained_path = url
+    args.n_colors = n_colors
+    args.pretrained_path = pretrained_path if pretrained_path else url
     return Encoder(args)
 
 

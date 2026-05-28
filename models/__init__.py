@@ -7,3 +7,6 @@ from . import unet
 from . import rdn
 from . import hat
 from . import swinir
+from . import spynet
+from . import fusion
+from . import gaussian_fusion

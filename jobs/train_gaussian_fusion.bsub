@@ -1,0 +1,41 @@
+#!/bin/bash -l
+#BSUB -J GaussianFusion-train
+#BSUB -o jobs/gaussian_fusion_train.%J.stdout
+#BSUB -e jobs/gaussian_fusion_train.%J.stderr
+#BSUB -q batch_a100
+#BSUB -W 48:00
+#BSUB -n 16
+#BSUB -M 51200
+#BSUB -gpu "num=2:aff=no"
+
+set -e
+
+module purge
+module load conda/4.11.0
+module load cuda/12.9.1
+conda activate gsplat
+
+cd /home/izi2sgh/MYDATA/sunny/ContinuousSR
+nvidia-smi
+
+export TORCH_CUDA_ARCH_LIST="9.0"
+export NCCL_DEBUG=INFO
+export MASTER_ADDR=localhost
+export MASTER_PORT=29500
+
+# Multi-GPU DDP with gsplat:
+# gsplat CUDA kernels only work on cuda:0, so each rank must see exactly 1 GPU.
+# We launch separate processes with per-rank CUDA_VISIBLE_DEVICES.
+NGPU=2
+
+for ((RANK=0; RANK<NGPU; RANK++)); do
+    CUDA_VISIBLE_DEVICES=$RANK \
+    RANK=$RANK LOCAL_RANK=0 WORLD_SIZE=$NGPU \
+    python train.py \
+        --config configs/train/train-m3svd-fusion.yaml \
+        --save_dir ./save/gaussian_fusion \
+        --wandb_project GaussianFusion \
+        --wandb_run "exp01-b16x2gpu-ep200" \
+        --wandb_offline &
+done
+wait
