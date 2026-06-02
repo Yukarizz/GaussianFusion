@@ -30,3 +30,5 @@ wandb/
 # OS
 .DS_Store
 Thumbs.db
+overfit_vis/
+jobs/

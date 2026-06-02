@@ -9,4 +9,5 @@ from . import hat
 from . import swinir
 from . import spynet
 from . import fusion
+from . import temporal_attention
 from . import gaussian_fusion

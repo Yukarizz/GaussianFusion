@@ -35,7 +35,6 @@ for ((RANK=0; RANK<NGPU; RANK++)); do
         --config configs/train/train-m3svd-fusion.yaml \
         --save_dir ./save/gaussian_fusion \
         --wandb_project GaussianFusion \
-        --wandb_run "exp01-b16x2gpu-ep200" \
-        --wandb_offline &
+        --wandb_run "exp01-b16x2gpu-ep200" &
 done
 wait

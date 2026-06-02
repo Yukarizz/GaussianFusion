@@ -6,6 +6,7 @@ Supports arbitrary spatiotemporal super-resolution.
 """
 
 import argparse
+import math
 import os
 import random
 
@@ -23,11 +24,12 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR, SequentialLR
 import yaml
 from tqdm import tqdm
 import wandb
+from torchvision.utils import save_image
 
 import models
 import datasets
 from utils import Averager, Timer, time_text, set_log_path, log
-
+import kornia
 
 def is_main_process():
     return not dist.is_initialized() or dist.get_rank() == 0
@@ -52,76 +54,110 @@ def cleanup_distributed():
         dist.destroy_process_group()
 
 
-def ssim_loss(pred, target, window_size=11, channel=3):
-    """Compute 1 - SSIM as a loss (differentiable)."""
-    C1 = 0.01 ** 2
-    C2 = 0.03 ** 2
+class GradientLoss(nn.Module):
+    """
+    使用 Sobel 算子提取图像的梯度幅值，用于计算纹理损失。
+    支持多通道（如 RGB = 3通道）的深度可分离卷积。
+    """
+    def __init__(self, channels=3):
+        super().__init__()
+        # 定义 Sobel 卷积核
+        kernel_x = torch.tensor([[-1.,  0.,  1.], 
+                                 [-2.,  0.,  2.], 
+                                 [-1.,  0.,  1.]])
+        kernel_y = torch.tensor([[-1., -2., -1.], 
+                                 [ 0.,  0.,  0.], 
+                                 [ 1.,  2.,  1.]])
+        
+        # 调整形状为 [out_channels, in_channels/groups, kH, kW]
+        # 这里使用 depthwise 卷积，所以 in_channels/groups = 1
+        self.weight_x = nn.Parameter(kernel_x.view(1, 1, 3, 3).repeat(channels, 1, 1, 1), requires_grad=False)
+        self.weight_y = nn.Parameter(kernel_y.view(1, 1, 3, 3).repeat(channels, 1, 1, 1), requires_grad=False)
 
-    # Create Gaussian window
-    sigma = 1.5
-    coords = torch.arange(window_size, dtype=torch.float32) - window_size // 2
-    g = torch.exp(-(coords ** 2) / (2 * sigma ** 2))
-    g = g / g.sum()
-    window = g.unsqueeze(1) @ g.unsqueeze(0)
-    window = window.unsqueeze(0).unsqueeze(0).expand(channel, 1, -1, -1).contiguous()
-    window = window.to(pred.device)
+    def forward(self, x):
+        # groups=x.shape[1] 确保分别对 R, G, B 通道计算梯度
+        grad_x = F.conv2d(x, self.weight_x.to(x.device), padding=1, groups=x.shape[1])
+        grad_y = F.conv2d(x, self.weight_y.to(x.device), padding=1, groups=x.shape[1])
+        
+        # 计算梯度幅值 (L1 范数近似)
+        return torch.abs(grad_x) + torch.abs(grad_y)
 
-    mu1 = F.conv2d(pred, window, padding=window_size // 2, groups=channel)
-    mu2 = F.conv2d(target, window, padding=window_size // 2, groups=channel)
-
-    mu1_sq = mu1 ** 2
-    mu2_sq = mu2 ** 2
-    mu1_mu2 = mu1 * mu2
-
-    sigma1_sq = F.conv2d(pred * pred, window, padding=window_size // 2, groups=channel) - mu1_sq
-    sigma2_sq = F.conv2d(target * target, window, padding=window_size // 2, groups=channel) - mu2_sq
-    sigma12 = F.conv2d(pred * target, window, padding=window_size // 2, groups=channel) - mu1_mu2
-
-    ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / \
-               ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
-
-    return 1 - ssim_map.mean()
 
 
 class FusionLoss(nn.Module):
     """
-    Combined loss for multi-modal temporal fusion.
-
-    L = λ₁·L1(fused, vis_gt) + λ₁·L1(fused, ir_gt)
-      + λ₂·SSIM(fused, vis_gt) + λ₂·SSIM(fused, ir_gt)
-      + λ₃·MSE(fused, max(vis_gt, ir_gt))
+    Decoupled combined loss for multi-modal temporal fusion.
+    
+    L = λ_int * L1_intensity + λ_color * L1_color + λ_grad * L1_gradient
+    
+    1. Intensity Target: max(vis_y, ir_y) on Y channel to preserve IR thermal targets and Vis highlights.
+    2. Color Target: L1 distance between fused CbCr and Vis CbCr to maintain natural colors.
+    3. Gradient Target: max(|grad_vis|, |grad_ir|) to preserve sharpest textures from both modalities.
     """
 
-    def __init__(self, lambda_l1=1.0, lambda_ssim=0.5, lambda_max=0.5):
+    def __init__(self, lambda_int=1.0, lambda_color=1.0, lambda_grad=5.0, channels=3):
         super().__init__()
-        self.lambda_l1 = lambda_l1
-        self.lambda_ssim = lambda_ssim
-        self.lambda_max = lambda_max
+        self.lambda_int = lambda_int
+        self.lambda_color = lambda_color  # 色彩损失权重
+        self.lambda_grad = lambda_grad 
+        
         self.l1 = nn.L1Loss()
-        self.mse = nn.MSELoss()
+        self.grad_operator = GradientLoss(channels=channels)
 
     def forward(self, fused, vis_gt, ir_gt):
         """
         Args:
-            fused: Model output [B, 3, H, W].
-            vis_gt: Visible GT [B, 3, H, W].
-            ir_gt: Infrared GT [B, 3, H, W].
+            fused: Model output [B, 3, H, W] (RGB).
+            vis_gt: Visible GT [B, 3, H, W] (RGB).
+            ir_gt: Infrared GT [B, 3, H, W] (1-channel repeated 3 times).
         """
-        # L1 temporal accuracy
-        loss_l1 = self.l1(fused, vis_gt) + self.l1(fused, ir_gt)
-
-        # SSIM structural preservation
-        loss_ssim = ssim_loss(fused, vis_gt) + ssim_loss(fused, ir_gt)
-
-        # Max-intensity preservation (thermal radiation)
-        max_gt = torch.max(vis_gt, ir_gt)
-        loss_max = self.mse(fused, max_gt)
-
-        total = self.lambda_l1 * loss_l1 + self.lambda_ssim * loss_ssim + self.lambda_max * loss_max
+        # ==========================================
+        # 1. 强度损失 (Intensity Loss) & 色彩损失 (Color Loss)
+        # ==========================================
+        # 使用 kornia 将 RGB 转换到 YCbCr 色彩空间
+        fused_ycbcr = kornia.color.rgb_to_ycbcr(fused)
+        vis_ycbcr = kornia.color.rgb_to_ycbcr(vis_gt)
+        
+        # 提取 Y 通道 (亮度)，保持 shape 为 [B, 1, H, W]
+        fused_y = fused_ycbcr[:, 0:1, :, :]
+        vis_y = vis_ycbcr[:, 0:1, :, :]
+        
+        # 红外图像为单通道重复3次，提取第1个通道作为红外强度
+        ir_int = ir_gt[:, 0:1, :, :]
+        
+        # 采用像素级最大值，保留 Vis 高光和 IR 热源 (仅在亮度通道进行)
+        target_int = torch.max(vis_y, ir_int)
+        loss_int = self.l1(fused_y, target_int)
+        
+        # [新增] 色彩损失：提取 Cb 和 Cr 通道，约束融合图像的色彩与可见光一致
+        fused_cbcr = fused_ycbcr[:, 1:, :, :]
+        vis_cbcr = vis_ycbcr[:, 1:, :, :]
+        loss_color = self.l1(fused_cbcr, vis_cbcr)
+        
+        # ==========================================
+        # 2. 梯度/纹理损失 (Gradient Loss)
+        # ==========================================
+        # 梯度损失依然可以在原始 RGB 空间计算，或者也可以改为仅在 Y 通道计算
+        # 这里保持在你原有的设定（对全部通道算梯度）
+        grad_fused = self.grad_operator(fused)
+        with torch.no_grad():
+            grad_vis = self.grad_operator(vis_gt)
+            grad_ir = self.grad_operator(ir_gt)
+            target_grad = torch.max(grad_vis, grad_ir) 
+            
+        loss_grad = self.l1(grad_fused, target_grad)
+        
+        # ==========================================
+        # 综合计算
+        # ==========================================
+        total = (self.lambda_int * loss_int + 
+                 self.lambda_color * loss_color + 
+                 self.lambda_grad * loss_grad)
+        
         return total, {
-            'loss_l1': loss_l1.item(),
-            'loss_ssim': loss_ssim.item(),
-            'loss_max': loss_max.item(),
+            'loss_int': loss_int.item(),
+            'loss_color': loss_color.item(),
+            'loss_grad': loss_grad.item(),
             'loss_total': total.item(),
         }
 
@@ -159,8 +195,13 @@ def train_epoch(model, loader, optimizer, criterion, device, epoch, global_step,
     if hasattr(loader, 'sampler') and hasattr(loader.sampler, 'set_epoch'):
         loader.sampler.set_epoch(epoch)
     loss_avg = Averager()
-    loss_components = {'loss_l1': Averager(), 'loss_ssim': Averager(),
-                       'loss_max': Averager()}
+    loss_ema = None
+    ema_decay = 0.99
+    loss_components = {
+        'loss_int': Averager(),
+        'loss_color': Averager(),
+        'loss_grad': Averager(),
+    }
 
     use_amp = scaler is not None
 
@@ -175,10 +216,19 @@ def train_epoch(model, loader, optimizer, criterion, device, epoch, global_step,
         tau = batch['tau'].to(device, non_blocking=True)
         scale = batch['scale'].to(device, non_blocking=True)
 
-        # Forward with AMP
+        # Forward with AMP (pass full tau tensor for per-sample temporal blending)
         with torch.amp.autocast('cuda', enabled=use_amp):
-            fused = model(vis_0, ir_0, vis_N, ir_N, scale=scale, tau=tau[0])
+            fused = model(vis_0, ir_0, vis_N, ir_N, scale=scale, tau=tau)
             loss, loss_dict = criterion(fused, vis_gt, ir_gt)
+
+        # Skip step if loss is NaN/Inf or spikes too far above EMA
+        cur_loss = loss.item()
+        if not math.isfinite(cur_loss):
+            optimizer.zero_grad(set_to_none=True)
+            continue
+        if loss_ema is not None and cur_loss > 10 * loss_ema + 0.1:
+            optimizer.zero_grad(set_to_none=True)
+            continue
 
         # Backward with gradient scaling + clipping
         optimizer.zero_grad(set_to_none=True)
@@ -194,29 +244,41 @@ def train_epoch(model, loader, optimizer, criterion, device, epoch, global_step,
             optimizer.step()
 
         loss_avg.add(loss.item())
+        loss_ema = loss.item() if loss_ema is None else ema_decay * loss_ema + (1 - ema_decay) * loss.item()
         for k in loss_components:
             loss_components[k].add(loss_dict[k])
-
+    
         # wandb per-step logging
         global_step += 1
         if global_step % 50 == 0 and is_main_process():
-            wandb.log({
+            log_dict = {
                 'train/loss_total': loss_dict['loss_total'],
-                'train/loss_l1': loss_dict['loss_l1'],
-                'train/loss_ssim': loss_dict['loss_ssim'],
-                'train/loss_max': loss_dict['loss_max'],
+                'train/loss_int': loss_dict['loss_int'],
+                'train/loss_color': loss_dict['loss_color'],
+                'train/loss_grad': loss_dict['loss_grad'],
                 'train/lr': optimizer.param_groups[0]['lr'],
-            }, step=global_step)
+            }
+            # Log Gaussian health metrics
+            raw_model = model.module if dist.is_initialized() else model
+            if hasattr(raw_model, '_debug_stats'):
+                for k, v in raw_model._debug_stats.items():
+                    log_dict[f'gaussian/{k}'] = v
+            wandb.log(log_dict, step=global_step)
 
-        pbar.set_postfix(loss=f'{loss_avg.item():.4f}')
+        pbar.set_postfix(
+            total=f'{loss_dict["loss_total"]:.4f}',
+            int=f'{loss_dict["loss_int"]:.4f}',
+            color=f'{loss_dict["loss_color"]:.4f}',
+            grad=f'{loss_dict["loss_grad"]:.4f}',
+        )
 
     # Epoch-level averages
     if is_main_process():
         epoch_metrics = {
             'epoch/train_loss': loss_avg.item(),
-            'epoch/loss_l1': loss_components['loss_l1'].item(),
-            'epoch/loss_ssim': loss_components['loss_ssim'].item(),
-            'epoch/loss_max': loss_components['loss_max'].item(),
+            'epoch/loss_int': loss_components['loss_int'].item(),
+            'epoch/loss_color': loss_components['loss_color'].item(),
+            'epoch/loss_grad': loss_components['loss_grad'].item(),
             'epoch/lr': optimizer.param_groups[0]['lr'],
         }
         wandb.log(epoch_metrics, step=global_step)
@@ -240,7 +302,7 @@ def validate(model, loader, criterion, device, global_step, log_images=False):
         ir_gt = batch['ir_gt'].to(device)
         tau = batch['tau'].to(device)
 
-        fused = model(vis_0, ir_0, vis_N, ir_N, scale=(1.0, 1.0), tau=tau[0])
+        fused = model(vis_0, ir_0, vis_N, ir_N, scale=(1.0, 1.0), tau=tau)
         loss, _ = criterion(fused, vis_gt, ir_gt)
         loss_avg.add(loss.item())
 
@@ -337,10 +399,15 @@ def main():
 
     # Loss
     criterion = FusionLoss(
-        lambda_l1=config.get('lambda_l1', 1.0),
-        lambda_ssim=config.get('lambda_ssim', 0.5),
-        lambda_max=config.get('lambda_max', 0.5),
+        lambda_int=config.get('lambda_int', config.get('lambda_l1', 1.0)),
+        lambda_color=config.get('lambda_color', 1.0),
+        lambda_grad=config.get('lambda_grad', 5.0),
     )
+    if is_main_process():
+        log('Loss weights: '
+            f'lambda_int={criterion.lambda_int}, '
+            f'lambda_color={criterion.lambda_color}, '
+            f'lambda_grad={criterion.lambda_grad}')
 
     # Resume
     start_epoch = 1
@@ -356,7 +423,7 @@ def main():
     best_loss = float('inf')
     global_step = 0
     use_amp = config.get('use_amp', True)
-    scaler = torch.amp.GradScaler('cuda') if use_amp else None
+    scaler = torch.amp.GradScaler('cuda', growth_interval=5000) if use_amp else None
 
     for epoch in range(start_epoch, total_epochs + 1):
         timer.s()
@@ -368,6 +435,44 @@ def main():
         if is_main_process():
             log(f'Epoch {epoch}/{total_epochs} | Loss: {train_loss:.4f} | '
                 f'LR: {scheduler.get_last_lr()[0]:.2e} | Time: {time_text(elapsed)}')
+
+        # Save visualization samples
+        if is_main_process() and epoch % config.get('val_every', 5) == 0:
+            vis_dir = os.path.join(args.save_dir, 'vis')
+            os.makedirs(vis_dir, exist_ok=True)
+            vis_model = model.module if dist.is_initialized() else model
+            vis_model.eval()
+            with torch.no_grad():
+                sample_batch = next(iter(train_loader))
+                v0 = sample_batch['vis_anchor0'][:4].to(device)
+                i0 = sample_batch['ir_anchor0'][:4].to(device)
+                vN = sample_batch['vis_anchor1'][:4].to(device)
+                iN = sample_batch['ir_anchor1'][:4].to(device)
+                tau_s = sample_batch['tau'][:4].to(device)
+                sc = sample_batch['scale'][:4].to(device)
+                fused = vis_model(v0, i0, vN, iN, scale=sc, tau=tau_s)
+                # Layout: Row1: vis_t0 | ir_t0 | vis_tN | ir_tN
+                #          Row2: fused  | avg_gt | vis_gt | ir_gt
+                vgt = sample_batch['vis_gt'][:4].to(device)
+                igt = sample_batch['ir_gt'][:4].to(device)
+                avg_gt = (vgt + igt) / 2.0
+                for j in range(min(4, fused.shape[0])):
+                    row1 = torch.cat([v0[j], i0[j], vN[j], iN[j]], dim=2)
+                    row2 = torch.cat([fused[j].clamp(0,1), avg_gt[j], vgt[j], igt[j]], dim=2)
+                    grid = torch.cat([row1, row2], dim=1)
+                    save_image(grid, os.path.join(vis_dir, f'epoch{epoch:03d}_sample{j}.png'))
+                try:
+                    wandb_images = [wandb.Image(
+                        torch.cat([
+                            torch.cat([v0[j], i0[j], vN[j], iN[j]], dim=2),
+                            torch.cat([fused[j].clamp(0,1), avg_gt[j], vgt[j], igt[j]], dim=2),
+                        ], dim=1).cpu(),
+                        caption=f'Row1: vis_t0|ir_t0|vis_tN|ir_tN  Row2: fused|avg_gt|vis_gt|ir_gt (tau={tau_s[j]:.2f})')
+                        for j in range(min(4, fused.shape[0]))]
+                    wandb.log({'train/vis_samples': wandb_images}, step=global_step)
+                except Exception as e:
+                    log(f'  Warning: wandb image logging failed: {e}')
+            vis_model.train()
 
         # Validation (if val loader exists)
         val_every = config.get('val_every', 5)
