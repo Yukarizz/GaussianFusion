@@ -50,4 +50,5 @@ val_every: 1
 # Loss weights
 lambda_int: 1.0
 lambda_color: 1.0
-lambda_grad: 5.0
+lambda_grad: 2.0
+lambda_temporal: 0.05

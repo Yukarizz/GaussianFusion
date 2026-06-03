@@ -61,6 +61,8 @@ class TemporalCrossAttention(nn.Module):
         super().__init__()
         self.n_feats = n_feats
         self.tau_dim = tau_dim
+        self.last_reg_loss = None
+        self._debug_stats = {}
 
         # τ positional encoding
         self.tau_embed = SinusoidalPosEmb(tau_dim)
@@ -118,11 +120,29 @@ class TemporalCrossAttention(nn.Module):
             tau_flat = torch.tensor([tau], device=feat_0.device).expand(B)
 
         # Step 1: Warp features to time τ using flow
-        flow_0t = t_b * flow_01
-        flow_1t = (1 - t_b) * flow_10
-        warped_0 = flow_warp(feat_0, flow_0t)  # [B, C, H, W]
-        warped_1 = flow_warp(feat_1, flow_1t)  # [B, C, H, W]
+        
+        # flow_0t = t_b * flow_01
+        # flow_1t = (1 - t_b) * flow_10
+        # warped_0 = flow_warp(feat_0, flow_0t)  # [B, C, H, W]
+        # warped_1 = flow_warp(feat_1, flow_1t)  # [B, C, H, W]
 
+        # Step 1: Warp features to time τ using Super-SloMo quadratic flow approximation
+        # Super-SloMo estimates intermediate backward flows:
+        #   F_t_0 = -t(1-t) * F_0_1 + t^2       * F_1_0
+        #   F_t_1 = (1-t)^2  * F_0_1 - t(1-t)   * F_1_0
+        #
+        # These flows are then used to backwarp frame/feature 0 and frame/feature 1
+        # into the intermediate time t.
+        t = t_b
+        one_minus_t = 1.0 - t
+        temp = -t * one_minus_t
+
+        flow_t0 = temp * flow_01 + (t * t) * flow_10
+        flow_t1 = (one_minus_t * one_minus_t) * flow_01 + temp * flow_10
+
+        warped_0 = flow_warp(feat_0, flow_t0)  # [B, C, H, W]
+        warped_1 = flow_warp(feat_1, flow_t1)  # [B, C, H, W]
+        
         # Step 2: τ conditioning
         tau_emb = self.tau_embed(tau_flat)       # [B, tau_dim]
         tau_feat = self.tau_mlp(tau_emb)         # [B, n_feats]
@@ -153,6 +173,37 @@ class TemporalCrossAttention(nn.Module):
 
         w0 = w[:, 0:1]  # [B, 1, H, W]
         w1 = w[:, 1:2]  # [B, 1, H, W]
+
+        # Differentiable anti-collapse regularization.
+        # The target is a soft temporal prior, not a hard constraint:
+        # earlier τ should lean to frame 0, later τ should lean to frame N.
+        tau_prior = tau_flat.view(B, 1, 1, 1).to(device=w.device, dtype=w.dtype)
+        target_w = torch.cat([1.0 - tau_prior, tau_prior], dim=1).expand_as(w)
+        prior_loss = F.smooth_l1_loss(w, target_w)
+
+        # Keep attention from becoming one-hot too early, especially near mid-time.
+        # Maximum 2-way entropy is log(2); required entropy is relaxed near boundaries.
+        w_safe = w.clamp_min(1e-6)
+        entropy = -(w_safe * w_safe.log()).sum(dim=1)  # [B, H, W]
+        midness = (1.0 - (2.0 * tau_flat - 1.0).abs()).view(B, 1, 1).to(entropy.dtype)
+        min_entropy = 0.35 * midness
+        entropy_loss = F.relu(min_entropy - entropy).mean()
+        self.last_reg_loss = prior_loss + 0.1 * entropy_loss
+
+        with torch.no_grad():
+            max_w = w.max(dim=1).values
+            self._debug_stats = {
+                'w0_mean': w0.mean().item(),
+                'w1_mean': w1.mean().item(),
+                'w0_std': w0.std().item(),
+                'w1_std': w1.std().item(),
+                'target_w0_mean': (1.0 - tau_flat).mean().item(),
+                'target_w1_mean': tau_flat.mean().item(),
+                'entropy_mean': entropy.mean().item(),
+                'dominance_frac': (max_w > 0.9).float().mean().item(),
+                'prior_loss': prior_loss.detach().item(),
+                'entropy_loss': entropy_loss.detach().item(),
+            }
 
         # Step 4: Weighted blend with value projections
         v0 = self.v0_proj(warped_0)

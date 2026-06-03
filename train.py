@@ -89,22 +89,25 @@ class FusionLoss(nn.Module):
     Decoupled combined loss for multi-modal temporal fusion.
     
     L = λ_int * L1_intensity + λ_color * L1_color + λ_grad * L1_gradient
+        + λ_temporal * L_temporal
     
     1. Intensity Target: max(vis_y, ir_y) on Y channel to preserve IR thermal targets and Vis highlights.
     2. Color Target: L1 distance between fused CbCr and Vis CbCr to maintain natural colors.
     3. Gradient Target: max(|grad_vis|, |grad_ir|) to preserve sharpest textures from both modalities.
     """
 
-    def __init__(self, lambda_int=1.0, lambda_color=1.0, lambda_grad=5.0, channels=3):
+    def __init__(self, lambda_int=1.0, lambda_color=1.0, lambda_grad=5.0,
+                 lambda_temporal=0.0, channels=3):
         super().__init__()
         self.lambda_int = lambda_int
         self.lambda_color = lambda_color  # 色彩损失权重
         self.lambda_grad = lambda_grad 
+        self.lambda_temporal = lambda_temporal
         
         self.l1 = nn.L1Loss()
         self.grad_operator = GradientLoss(channels=channels)
 
-    def forward(self, fused, vis_gt, ir_gt):
+    def forward(self, fused, vis_gt, ir_gt, temporal_loss=None):
         """
         Args:
             fused: Model output [B, 3, H, W] (RGB).
@@ -153,13 +156,69 @@ class FusionLoss(nn.Module):
         total = (self.lambda_int * loss_int + 
                  self.lambda_color * loss_color + 
                  self.lambda_grad * loss_grad)
+        if temporal_loss is None:
+            temporal_loss = fused.new_tensor(0.0)
+        total = total + self.lambda_temporal * temporal_loss
         
         return total, {
             'loss_int': loss_int.item(),
             'loss_color': loss_color.item(),
             'loss_grad': loss_grad.item(),
+            'loss_temporal': temporal_loss.detach().item(),
             'loss_total': total.item(),
         }
+
+
+def _resize_like(x, ref):
+    if x.shape[-2:] == ref.shape[-2:]:
+        return x
+    return F.interpolate(x, size=ref.shape[-2:], mode='bilinear', align_corners=False)
+
+
+@torch.no_grad()
+def _psnr(pred, target):
+    mse = F.mse_loss(pred, target, reduction='none').flatten(1).mean(dim=1).clamp_min(1e-10)
+    return (-10.0 * torch.log10(mse)).mean().item()
+
+
+@torch.no_grad()
+def collapse_diagnostics(fused, vis_0, ir_0, vis_N, ir_N, vis_gt, ir_gt, tau):
+    """Metrics that reveal endpoint-copying or naive averaging behavior."""
+    vis_0 = _resize_like(vis_0, fused)
+    ir_0 = _resize_like(ir_0, fused)
+    vis_N = _resize_like(vis_N, fused)
+    ir_N = _resize_like(ir_N, fused)
+    vis_avg = 0.5 * (vis_0 + vis_N)
+    ir_avg = 0.5 * (ir_0 + ir_N)
+    fusion_avg = 0.5 * (vis_gt + ir_gt)
+
+    l1_vis0 = F.l1_loss(fused, vis_0).item()
+    l1_visN = F.l1_loss(fused, vis_N).item()
+    l1_ir0 = F.l1_loss(fused, ir_0).item()
+    l1_irN = F.l1_loss(fused, ir_N).item()
+    l1_vis0_sample = (fused - vis_0).abs().flatten(1).mean(dim=1)
+    l1_visN_sample = (fused - vis_N).abs().flatten(1).mean(dim=1)
+    l1_ir0_sample = (fused - ir_0).abs().flatten(1).mean(dim=1)
+    l1_irN_sample = (fused - ir_N).abs().flatten(1).mean(dim=1)
+
+    return {
+        'diag/l1_to_vis0': l1_vis0,
+        'diag/l1_to_visN': l1_visN,
+        'diag/l1_to_ir0': l1_ir0,
+        'diag/l1_to_irN': l1_irN,
+        'diag/l1_to_nearest_endpoint': torch.stack([
+            l1_vis0_sample, l1_visN_sample, l1_ir0_sample, l1_irN_sample
+        ], dim=1).min(dim=1).values.mean().item(),
+        'diag/l1_to_vis_endpoint_avg': F.l1_loss(fused, vis_avg).item(),
+        'diag/l1_to_ir_endpoint_avg': F.l1_loss(fused, ir_avg).item(),
+        'diag/l1_to_fusion_gt_avg': F.l1_loss(fused, fusion_avg).item(),
+        'diag/l1_to_vis_gt': F.l1_loss(fused, vis_gt).item(),
+        'diag/l1_to_ir_gt': F.l1_loss(fused, ir_gt).item(),
+        'diag/psnr_to_vis_gt': _psnr(fused, vis_gt),
+        'diag/psnr_to_fusion_gt_avg': _psnr(fused, fusion_avg),
+        'diag/tau_mean': tau.mean().item(),
+        'diag/tau_mid_frac': ((tau > 0.375) & (tau < 0.625)).float().mean().item(),
+    }
 
 
 def make_data_loader(config, tag='train'):
@@ -201,6 +260,7 @@ def train_epoch(model, loader, optimizer, criterion, device, epoch, global_step,
         'loss_int': Averager(),
         'loss_color': Averager(),
         'loss_grad': Averager(),
+        'loss_temporal': Averager(),
     }
 
     use_amp = scaler is not None
@@ -217,9 +277,11 @@ def train_epoch(model, loader, optimizer, criterion, device, epoch, global_step,
         scale = batch['scale'].to(device, non_blocking=True)
 
         # Forward with AMP (pass full tau tensor for per-sample temporal blending)
+        raw_model = model.module if dist.is_initialized() else model
         with torch.amp.autocast('cuda', enabled=use_amp):
             fused = model(vis_0, ir_0, vis_N, ir_N, scale=scale, tau=tau)
-            loss, loss_dict = criterion(fused, vis_gt, ir_gt)
+            temporal_loss = raw_model.get_temporal_regularization() if hasattr(raw_model, 'get_temporal_regularization') else None
+            loss, loss_dict = criterion(fused, vis_gt, ir_gt, temporal_loss=temporal_loss)
 
         # Skip step if loss is NaN/Inf or spikes too far above EMA
         cur_loss = loss.item()
@@ -256,13 +318,16 @@ def train_epoch(model, loader, optimizer, criterion, device, epoch, global_step,
                 'train/loss_int': loss_dict['loss_int'],
                 'train/loss_color': loss_dict['loss_color'],
                 'train/loss_grad': loss_dict['loss_grad'],
+                'train/loss_temporal': loss_dict['loss_temporal'],
                 'train/lr': optimizer.param_groups[0]['lr'],
             }
+            log_dict.update(collapse_diagnostics(fused.detach(), vis_0, ir_0, vis_N, ir_N, vis_gt, ir_gt, tau))
             # Log Gaussian health metrics
-            raw_model = model.module if dist.is_initialized() else model
             if hasattr(raw_model, '_debug_stats'):
                 for k, v in raw_model._debug_stats.items():
-                    log_dict[f'gaussian/{k}'] = v
+                    prefix = 'temporal' if k.startswith('temporal_') else 'gaussian'
+                    metric_name = k[len('temporal_'):] if k.startswith('temporal_') else k
+                    log_dict[f'{prefix}/{metric_name}'] = v
             wandb.log(log_dict, step=global_step)
 
         pbar.set_postfix(
@@ -270,6 +335,7 @@ def train_epoch(model, loader, optimizer, criterion, device, epoch, global_step,
             int=f'{loss_dict["loss_int"]:.4f}',
             color=f'{loss_dict["loss_color"]:.4f}',
             grad=f'{loss_dict["loss_grad"]:.4f}',
+            temp=f'{loss_dict["loss_temporal"]:.4f}',
         )
 
     # Epoch-level averages
@@ -279,6 +345,7 @@ def train_epoch(model, loader, optimizer, criterion, device, epoch, global_step,
             'epoch/loss_int': loss_components['loss_int'].item(),
             'epoch/loss_color': loss_components['loss_color'].item(),
             'epoch/loss_grad': loss_components['loss_grad'].item(),
+            'epoch/loss_temporal': loss_components['loss_temporal'].item(),
             'epoch/lr': optimizer.param_groups[0]['lr'],
         }
         wandb.log(epoch_metrics, step=global_step)
@@ -291,7 +358,14 @@ def validate(model, loader, criterion, device, global_step, log_images=False):
     """Validation step with wandb logging."""
     model.eval()
     loss_avg = Averager()
+    loss_components = {
+        'loss_int': Averager(),
+        'loss_color': Averager(),
+        'loss_grad': Averager(),
+        'loss_temporal': Averager(),
+    }
     sample_logged = False
+    diag_logged = False
 
     for batch in loader:
         vis_0 = batch['vis_anchor0'].to(device)
@@ -303,8 +377,16 @@ def validate(model, loader, criterion, device, global_step, log_images=False):
         tau = batch['tau'].to(device)
 
         fused = model(vis_0, ir_0, vis_N, ir_N, scale=(1.0, 1.0), tau=tau)
-        loss, _ = criterion(fused, vis_gt, ir_gt)
+        temporal_loss = model.get_temporal_regularization() if hasattr(model, 'get_temporal_regularization') else None
+        loss, loss_dict = criterion(fused, vis_gt, ir_gt, temporal_loss=temporal_loss)
         loss_avg.add(loss.item())
+        for k in loss_components:
+            loss_components[k].add(loss_dict[k])
+
+        if not diag_logged:
+            diag = collapse_diagnostics(fused, vis_0, ir_0, vis_N, ir_N, vis_gt, ir_gt, tau)
+            wandb.log({f'val/{k.split("/", 1)[1]}': v for k, v in diag.items()}, step=global_step)
+            diag_logged = True
 
         # Log sample images (first batch only)
         if log_images and not sample_logged:
@@ -318,7 +400,13 @@ def validate(model, loader, criterion, device, global_step, log_images=False):
             sample_logged = True
 
     val_loss = loss_avg.item()
-    wandb.log({'val/loss': val_loss}, step=global_step)
+    wandb.log({
+        'val/loss': val_loss,
+        'val/loss_int': loss_components['loss_int'].item(),
+        'val/loss_color': loss_components['loss_color'].item(),
+        'val/loss_grad': loss_components['loss_grad'].item(),
+        'val/loss_temporal': loss_components['loss_temporal'].item(),
+    }, step=global_step)
     return val_loss
 
 
@@ -402,12 +490,14 @@ def main():
         lambda_int=config.get('lambda_int', config.get('lambda_l1', 1.0)),
         lambda_color=config.get('lambda_color', 1.0),
         lambda_grad=config.get('lambda_grad', 5.0),
+        lambda_temporal=config.get('lambda_temporal', 0.0),
     )
     if is_main_process():
         log('Loss weights: '
             f'lambda_int={criterion.lambda_int}, '
             f'lambda_color={criterion.lambda_color}, '
-            f'lambda_grad={criterion.lambda_grad}')
+            f'lambda_grad={criterion.lambda_grad}, '
+            f'lambda_temporal={criterion.lambda_temporal}')
 
     # Resume
     start_epoch = 1

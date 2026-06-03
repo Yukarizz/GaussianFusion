@@ -135,6 +135,8 @@ class GaussianFusion(nn.Module):
         self.register_buffer('gau_dict', gau_dict)
 
         self.background = None  # Lazy init on correct device
+        self._temporal_reg_loss = None
+        self._temporal_stats = {}
 
     def encode(self, vis, ir):
         """
@@ -174,10 +176,12 @@ class GaussianFusion(nn.Module):
             1,
         )
 
-        # PixelUnshuffle to get richer per-point features
+        # PixelUnshuffle to get richer per-point features.
+        # For scale=1 this keeps the original compact point set. For SR rendering
+        # (scale>1), the compact fh/2 × fw/2 grid becomes too sparse in the HR
+        # canvas and produces periodic low-coverage gaps. Densify to one Gaussian
+        # per LR pixel for scale>1 to avoid grid-like holes between samples.
         feat_ps = self.ps(feat)  # [B, C*4, fh/2, fw/2] = [B, 256, fh/2, fw/2]
-        ps_h, ps_w = feat_ps.shape[2], feat_ps.shape[3]
-        n_gaussians = ps_h * ps_w
 
         # τ FiLM modulation: condition Gaussian features on temporal position
         if tau is not None:
@@ -192,6 +196,13 @@ class GaussianFusion(nn.Module):
             gamma = film_params[:, :256].unsqueeze(-1).unsqueeze(-1) + 1.0  # [B, 256, 1, 1]
             beta = film_params[:, 256:].unsqueeze(-1).unsqueeze(-1)         # [B, 256, 1, 1]
             feat_ps = gamma * feat_ps + beta
+
+        dense_sr_render = max(scale_h, scale_w) > 1.0
+        if dense_sr_render:
+            feat_ps = F.interpolate(feat_ps, size=(fh, fw), mode='nearest')
+
+        ps_h, ps_w = feat_ps.shape[2], feat_ps.shape[3]
+        n_gaussians = ps_h * ps_w
 
         # Reshape: [B, 256, ps_h, ps_w] -> [B*ps_h*ps_w, 256]
         feat_flat = feat_ps.permute(0, 2, 3, 1).reshape(bs * n_gaussians, 256)
@@ -218,9 +229,8 @@ class GaussianFusion(nn.Module):
         if self.background is None or self.background.device != feat.device:
             self.background = torch.zeros(3, device=feat.device)
 
-        # Coordinate grid at the SAME density as ContinuousSR: 2× the ps resolution
-        # This gives ps_h*2 × ps_w*2 = fh × fw coordinates (one per LR pixel)
-        # But we only have ps_h*ps_w Gaussians. So we use the ps_h×ps_w grid.
+        # Coordinate grid matching the actual Gaussian feature grid. In SR mode
+        # this is densified to fh×fw, otherwise it stays at fh/2×fw/2.
         coords = get_coord(ps_h, ps_w).to(feat.device)  # [n_gaussians, 2] in [-1, 1]
         opacity = torch.ones(n_gaussians, 1, device=feat.device)
 
@@ -235,11 +245,13 @@ class GaussianFusion(nn.Module):
             xyz_y = coords[:, 1:2] + 2 * offset_i[:, 1:2] / ps_h - 1 / H
             xyz = torch.cat((xyz_x, xyz_y), dim=1)
 
-            # Scale covariance: ensure minimum std ≥ 0.5 pixel
-            # (radius=2, spacing=2 → moderate overlap without over-smoothing)
-            L11 = cov_i[:, 0] * scale_w / 2.0 + 0.5
+            # Scale covariance. In SR mode, a fixed 0.5px footprint is too small
+            # for the enlarged canvas and can leave periodic uncovered pixels.
+            min_std_w = max(0.5, 0.5 * scale_w) if dense_sr_render else 0.5
+            min_std_h = max(0.5, 0.5 * scale_h) if dense_sr_render else 0.5
+            L11 = cov_i[:, 0] * scale_w / 2.0 + min_std_w
             L21 = cov_i[:, 1] * scale_h / 2.0
-            L22 = cov_i[:, 2] * scale_h / 2.0 + 0.5
+            L22 = cov_i[:, 2] * scale_h / 2.0 + min_std_h
             weighted_cholesky = torch.stack([L11, L21, L22], dim=1)
 
             # Project and rasterize
@@ -279,6 +291,7 @@ class GaussianFusion(nn.Module):
                     'cholesky_L22_max': weighted_cholesky[:, 2].max().item(),
                     'color_mean': color_i.mean().item(),
                     'n_gaussians': n_gaussians,
+                    'dense_sr_render': float(dense_sr_render),
                 }
 
         return torch.cat(pred, dim=0)  # [B, 3, H, W]
@@ -342,16 +355,37 @@ class GaussianFusion(nn.Module):
 
         # --- Step 4: Temporal cross-attention to time τ (learnable) ---
         feat_vis_tau = self.temporal_attn(
-            feat_vis_0, feat_vis_N, flow_01, flow_10, tau
+            feat_vis_0, feat_vis_N, flow_01, flow_10, tau, self.occ_threshold
         )
+        vis_reg_loss = self.temporal_attn.last_reg_loss
+        vis_stats = dict(getattr(self.temporal_attn, '_debug_stats', {}))
+
         feat_ir_tau = self.temporal_attn(
-            feat_ir_0, feat_ir_N, flow_01, flow_10, tau
+            feat_ir_0, feat_ir_N, flow_01, flow_10, tau, self.occ_threshold
         )
+        ir_reg_loss = self.temporal_attn.last_reg_loss
+        ir_stats = dict(getattr(self.temporal_attn, '_debug_stats', {}))
+
+        if vis_reg_loss is not None and ir_reg_loss is not None:
+            self._temporal_reg_loss = 0.5 * (vis_reg_loss + ir_reg_loss)
+        else:
+            self._temporal_reg_loss = None
+        self._temporal_stats = {}
+        for k, v in vis_stats.items():
+            self._temporal_stats[f'temporal_vis_{k}'] = v
+        for k, v in ir_stats.items():
+            self._temporal_stats[f'temporal_ir_{k}'] = v
 
         # --- Step 5: Cross-modal fusion ---
         feat_fused = self.fusion(feat_vis_tau, feat_ir_tau)  # [B, 64, H, W]
 
         # --- Step 6: Gaussian rendering at target scale (τ-conditioned) ---
         output = self._render_gaussians(feat_fused, scale_h, scale_w, lr_h, lr_w, tau=tau)
+        if hasattr(self, '_debug_stats'):
+            self._debug_stats.update(self._temporal_stats)
 
         return output
+
+    def get_temporal_regularization(self):
+        """Return the latest differentiable temporal anti-collapse loss."""
+        return self._temporal_reg_loss

@@ -111,6 +111,7 @@ def temporal_blend(feat_0, feat_1, flow_01, flow_10, t, occ_threshold=1.0):
         t_b = float(t)
 
     # Interpolate flows to time t (use scalar for flow interpolation if possible)
+    
     flow_0t = t_b * flow_01
     flow_1t = (1 - t_b) * flow_10
 
