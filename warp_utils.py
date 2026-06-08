@@ -98,14 +98,22 @@ def temporal_blend(feat_0, feat_1, flow_01, flow_10, t, occ_threshold=1.0):
         feat_1: Features at frame 1 [B, C, H, W].
         flow_01: Flow from frame 0 to frame 1 [B, 2, H, W].
         flow_10: Flow from frame 1 to frame 0 [B, 2, H, W].
-        t: Temporal position in (0, 1).
+        t: Temporal position in (0, 1). Scalar or tensor [B] for per-sample tau.
         occ_threshold: Threshold for occlusion detection.
 
     Returns:
         Blended features at time t [B, C, H, W].
     """
-    # Interpolate flows to time t
-    flow_0t, flow_1t = temporal_interpolate_flow(flow_01, flow_10, t)
+    # Support per-sample t: reshape to [B, 1, 1, 1] for broadcasting
+    if isinstance(t, torch.Tensor) and t.dim() >= 1:
+        t_b = t.view(-1, 1, 1, 1).to(feat_0.device)
+    else:
+        t_b = float(t)
+
+    # Interpolate flows to time t (use scalar for flow interpolation if possible)
+    
+    flow_0t = t_b * flow_01
+    flow_1t = (1 - t_b) * flow_10
 
     # Warp features from both directions
     warped_0 = flow_warp(feat_0, flow_0t)   # frame 0 → time t
@@ -117,8 +125,8 @@ def temporal_blend(feat_0, feat_1, flow_01, flow_10, t, occ_threshold=1.0):
     occ_0 = (consistency < occ_threshold).float()  # 1 = frame 0 visible
 
     # Weighting
-    w0 = (1 - t) * occ_0
-    w1 = t + (1 - t) * (1 - occ_0)  # boost frame 1 where frame 0 is occluded
+    w0 = (1 - t_b) * occ_0
+    w1 = t_b + (1 - t_b) * (1 - occ_0)  # boost frame 1 where frame 0 is occluded
 
     # Normalize and blend
     blended = (w0 * warped_0 + w1 * warped_1) / (w0 + w1 + 1e-8)

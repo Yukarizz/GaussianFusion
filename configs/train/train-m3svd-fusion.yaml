@@ -21,7 +21,7 @@ model:
     spynet_pretrained: sintel-final
     n_feats: 64
     freeze_spynet: true
-    occ_threshold: 1.0
+    occ_threshold: 5.0
 
 # Training dataset
 train_dataset:
@@ -31,8 +31,8 @@ train_dataset:
     split: train
     vis_modality: visible_Enhance
     ir_modality: infrared_Enhance
-    n_min: 2
-    n_max: 16
+    n_min: 4
+    n_max: 8
     scale_min: 1.0
     scale_max: 1.0
     patch_size: 256
@@ -41,12 +41,16 @@ train_dataset:
 # Training hyperparameters
 batch_size: 16
 num_workers: 8
-epochs: 200
+epochs: 30
+warmup_epochs: 5
 lr: 1.0e-4
 weight_decay: 0
 save_every: 1
 val_every: 1
 # Loss weights
-lambda_l1: 1.0
-lambda_ssim: 0.5
-lambda_max: 0.5
+lambda_int: 1.0
+lambda_color: 1.0
+lambda_grad: 2.0
+lambda_temporal: 0.0
+lambda_aux_vis: 0.2
+lambda_aux_ir: 0.2

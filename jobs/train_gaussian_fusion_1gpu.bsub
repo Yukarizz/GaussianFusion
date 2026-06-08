@@ -2,7 +2,7 @@
 #BSUB -J GaussianFusion-1gpu
 #BSUB -o jobs/gaussian_fusion_train.%J.stdout
 #BSUB -e jobs/gaussian_fusion_train.%J.stderr
-#BSUB -q batch_a100
+#BSUB -q batch_h100
 #BSUB -W 48:00
 #BSUB -n 12
 #BSUB -M 51200
