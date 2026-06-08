@@ -32,7 +32,7 @@ train_dataset:
     vis_modality: visible_Enhance
     ir_modality: infrared_Enhance
     n_min: 4
-    n_max: 16
+    n_max: 8
     scale_min: 1.0
     scale_max: 1.0
     patch_size: 256

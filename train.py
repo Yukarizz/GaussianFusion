@@ -552,12 +552,14 @@ def main():
                     grid = torch.cat([row1, row2], dim=1)
                     save_image(grid, os.path.join(vis_dir, f'epoch{epoch:03d}_sample{j}.png'))
                 try:
+                    frame_info = sample_batch['frame_info'][j]
+
                     wandb_images = [wandb.Image(
                         torch.cat([
                             torch.cat([v0[j], i0[j], vN[j], iN[j]], dim=2),
                             torch.cat([fused[j].clamp(0,1), avg_gt[j], vgt[j], igt[j]], dim=2),
                         ], dim=1).cpu(),
-                        caption=f'Row1: vis_t0|ir_t0|vis_tN|ir_tN  Row2: fused|avg_gt|vis_gt|ir_gt (tau={tau_s[j]:.2f})')
+                        caption=f'Row1: vis_t0|ir_t0|vis_tN|ir_tN  Row2: fused|avg_gt|vis_gt|ir_gt | {frame_info} | tau={tau_s[j]:.2f}')
                         for j in range(min(4, fused.shape[0]))]
                     wandb.log({'train/vis_samples': wandb_images}, step=global_step)
                 except Exception as e:
