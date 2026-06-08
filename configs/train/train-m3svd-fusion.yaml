@@ -51,4 +51,6 @@ val_every: 1
 lambda_int: 1.0
 lambda_color: 1.0
 lambda_grad: 2.0
-lambda_temporal: 0.05
+lambda_temporal: 0.0
+lambda_aux_vis: 0.2
+lambda_aux_ir: 0.2

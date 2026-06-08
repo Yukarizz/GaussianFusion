@@ -89,7 +89,7 @@ class FusionLoss(nn.Module):
     Decoupled combined loss for multi-modal temporal fusion.
     
     L = λ_int * L1_intensity + λ_color * L1_color + λ_grad * L1_gradient
-        + λ_temporal * L_temporal
+        + λ_temporal * L_temporal + λ_aux_vis * L_aux_vis + λ_aux_ir * L_aux_ir
     
     1. Intensity Target: max(vis_y, ir_y) on Y channel to preserve IR thermal targets and Vis highlights.
     2. Color Target: L1 distance between fused CbCr and Vis CbCr to maintain natural colors.
@@ -97,17 +97,20 @@ class FusionLoss(nn.Module):
     """
 
     def __init__(self, lambda_int=1.0, lambda_color=1.0, lambda_grad=5.0,
-                 lambda_temporal=0.0, channels=3):
+                 lambda_temporal=0.0, lambda_aux_vis=0.0, lambda_aux_ir=0.0,
+                 channels=3):
         super().__init__()
         self.lambda_int = lambda_int
         self.lambda_color = lambda_color  # 色彩损失权重
         self.lambda_grad = lambda_grad 
         self.lambda_temporal = lambda_temporal
+        self.lambda_aux_vis = lambda_aux_vis
+        self.lambda_aux_ir = lambda_aux_ir
         
         self.l1 = nn.L1Loss()
         self.grad_operator = GradientLoss(channels=channels)
 
-    def forward(self, fused, vis_gt, ir_gt, temporal_loss=None):
+    def forward(self, fused, vis_gt, ir_gt, temporal_loss=None, aux_outputs=None):
         """
         Args:
             fused: Model output [B, 3, H, W] (RGB).
@@ -159,12 +162,32 @@ class FusionLoss(nn.Module):
         if temporal_loss is None:
             temporal_loss = fused.new_tensor(0.0)
         total = total + self.lambda_temporal * temporal_loss
+
+        loss_aux_vis = fused.new_tensor(0.0)
+        loss_aux_ir = fused.new_tensor(0.0)
+        if aux_outputs:
+            aux_vis = aux_outputs.get('vis_tau')
+            aux_ir = aux_outputs.get('ir_tau')
+            if aux_vis is not None:
+                vis_aux_gt = vis_gt
+                if aux_vis.shape[-2:] != vis_gt.shape[-2:]:
+                    vis_aux_gt = F.interpolate(vis_gt, size=aux_vis.shape[-2:], mode='bilinear', align_corners=False)
+                loss_aux_vis = self.l1(aux_vis, vis_aux_gt)
+            if aux_ir is not None:
+                ir_aux_gt = ir_gt
+                if aux_ir.shape[-2:] != ir_gt.shape[-2:]:
+                    ir_aux_gt = F.interpolate(ir_gt, size=aux_ir.shape[-2:], mode='bilinear', align_corners=False)
+                loss_aux_ir = self.l1(aux_ir, ir_aux_gt)
+
+        total = total + self.lambda_aux_vis * loss_aux_vis + self.lambda_aux_ir * loss_aux_ir
         
         return total, {
             'loss_int': loss_int.item(),
             'loss_color': loss_color.item(),
             'loss_grad': loss_grad.item(),
             'loss_temporal': temporal_loss.detach().item(),
+            'loss_aux_vis': loss_aux_vis.detach().item(),
+            'loss_aux_ir': loss_aux_ir.detach().item(),
             'loss_total': total.item(),
         }
 
@@ -261,6 +284,8 @@ def train_epoch(model, loader, optimizer, criterion, device, epoch, global_step,
         'loss_color': Averager(),
         'loss_grad': Averager(),
         'loss_temporal': Averager(),
+        'loss_aux_vis': Averager(),
+        'loss_aux_ir': Averager(),
     }
 
     use_amp = scaler is not None
@@ -281,7 +306,10 @@ def train_epoch(model, loader, optimizer, criterion, device, epoch, global_step,
         with torch.amp.autocast('cuda', enabled=use_amp):
             fused = model(vis_0, ir_0, vis_N, ir_N, scale=scale, tau=tau)
             temporal_loss = raw_model.get_temporal_regularization() if hasattr(raw_model, 'get_temporal_regularization') else None
-            loss, loss_dict = criterion(fused, vis_gt, ir_gt, temporal_loss=temporal_loss)
+            aux_outputs = raw_model.get_aux_outputs() if hasattr(raw_model, 'get_aux_outputs') else None
+            loss, loss_dict = criterion(fused, vis_gt, ir_gt,
+                                       temporal_loss=temporal_loss,
+                                       aux_outputs=aux_outputs)
 
         # Skip step if loss is NaN/Inf or spikes too far above EMA
         cur_loss = loss.item()
@@ -319,6 +347,8 @@ def train_epoch(model, loader, optimizer, criterion, device, epoch, global_step,
                 'train/loss_color': loss_dict['loss_color'],
                 'train/loss_grad': loss_dict['loss_grad'],
                 'train/loss_temporal': loss_dict['loss_temporal'],
+                'train/loss_aux_vis': loss_dict['loss_aux_vis'],
+                'train/loss_aux_ir': loss_dict['loss_aux_ir'],
                 'train/lr': optimizer.param_groups[0]['lr'],
             }
             log_dict.update(collapse_diagnostics(fused.detach(), vis_0, ir_0, vis_N, ir_N, vis_gt, ir_gt, tau))
@@ -336,6 +366,8 @@ def train_epoch(model, loader, optimizer, criterion, device, epoch, global_step,
             color=f'{loss_dict["loss_color"]:.4f}',
             grad=f'{loss_dict["loss_grad"]:.4f}',
             temp=f'{loss_dict["loss_temporal"]:.4f}',
+            aux_v=f'{loss_dict["loss_aux_vis"]:.4f}',
+            aux_i=f'{loss_dict["loss_aux_ir"]:.4f}',
         )
 
     # Epoch-level averages
@@ -346,6 +378,8 @@ def train_epoch(model, loader, optimizer, criterion, device, epoch, global_step,
             'epoch/loss_color': loss_components['loss_color'].item(),
             'epoch/loss_grad': loss_components['loss_grad'].item(),
             'epoch/loss_temporal': loss_components['loss_temporal'].item(),
+            'epoch/loss_aux_vis': loss_components['loss_aux_vis'].item(),
+            'epoch/loss_aux_ir': loss_components['loss_aux_ir'].item(),
             'epoch/lr': optimizer.param_groups[0]['lr'],
         }
         wandb.log(epoch_metrics, step=global_step)
@@ -363,6 +397,8 @@ def validate(model, loader, criterion, device, global_step, log_images=False):
         'loss_color': Averager(),
         'loss_grad': Averager(),
         'loss_temporal': Averager(),
+        'loss_aux_vis': Averager(),
+        'loss_aux_ir': Averager(),
     }
     sample_logged = False
     diag_logged = False
@@ -378,7 +414,10 @@ def validate(model, loader, criterion, device, global_step, log_images=False):
 
         fused = model(vis_0, ir_0, vis_N, ir_N, scale=(1.0, 1.0), tau=tau)
         temporal_loss = model.get_temporal_regularization() if hasattr(model, 'get_temporal_regularization') else None
-        loss, loss_dict = criterion(fused, vis_gt, ir_gt, temporal_loss=temporal_loss)
+        aux_outputs = model.get_aux_outputs() if hasattr(model, 'get_aux_outputs') else None
+        loss, loss_dict = criterion(fused, vis_gt, ir_gt,
+                       temporal_loss=temporal_loss,
+                       aux_outputs=aux_outputs)
         loss_avg.add(loss.item())
         for k in loss_components:
             loss_components[k].add(loss_dict[k])
@@ -406,6 +445,8 @@ def validate(model, loader, criterion, device, global_step, log_images=False):
         'val/loss_color': loss_components['loss_color'].item(),
         'val/loss_grad': loss_components['loss_grad'].item(),
         'val/loss_temporal': loss_components['loss_temporal'].item(),
+        'val/loss_aux_vis': loss_components['loss_aux_vis'].item(),
+        'val/loss_aux_ir': loss_components['loss_aux_ir'].item(),
     }, step=global_step)
     return val_loss
 
@@ -491,20 +532,34 @@ def main():
         lambda_color=config.get('lambda_color', 1.0),
         lambda_grad=config.get('lambda_grad', 5.0),
         lambda_temporal=config.get('lambda_temporal', 0.0),
+        lambda_aux_vis=config.get('lambda_aux_vis', 0.0),
+        lambda_aux_ir=config.get('lambda_aux_ir', 0.0),
     )
     if is_main_process():
         log('Loss weights: '
             f'lambda_int={criterion.lambda_int}, '
             f'lambda_color={criterion.lambda_color}, '
             f'lambda_grad={criterion.lambda_grad}, '
-            f'lambda_temporal={criterion.lambda_temporal}')
+            f'lambda_temporal={criterion.lambda_temporal}, '
+            f'lambda_aux_vis={criterion.lambda_aux_vis}, '
+            f'lambda_aux_ir={criterion.lambda_aux_ir}')
 
     # Resume
     start_epoch = 1
     if args.resume:
         checkpoint = torch.load(args.resume, map_location=device)
-        model.load_state_dict(checkpoint['model'])
-        optimizer.load_state_dict(checkpoint['optimizer'])
+        raw_model = model.module if dist.is_initialized() else model
+        incompatible = raw_model.load_state_dict(checkpoint['model'], strict=False)
+        if is_main_process() and incompatible.missing_keys:
+            log(f'  Warning: missing checkpoint keys initialized randomly: {incompatible.missing_keys}')
+        if is_main_process() and incompatible.unexpected_keys:
+            log(f'  Warning: ignored unexpected checkpoint keys: {incompatible.unexpected_keys}')
+        if 'optimizer' in checkpoint:
+            try:
+                optimizer.load_state_dict(checkpoint['optimizer'])
+            except ValueError as e:
+                if is_main_process():
+                    log(f'  Warning: optimizer state not loaded due to parameter mismatch: {e}')
         start_epoch = checkpoint['epoch'] + 1
         log(f'Resumed from epoch {start_epoch - 1}')
 

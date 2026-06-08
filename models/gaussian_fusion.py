@@ -95,6 +95,22 @@ class GaussianFusion(nn.Module):
             'args': {'in_channels': n_feats}
         })
 
+        # --- Auxiliary temporal reconstruction heads ---
+        # These heads force per-modality temporal features to reconstruct the
+        # intermediate visible / infrared targets before cross-modal fusion.
+        self.aux_vis_decoder = nn.Sequential(
+            nn.Conv2d(n_feats, n_feats, kernel_size=3, padding=1),
+            nn.LeakyReLU(0.1, inplace=True),
+            nn.Conv2d(n_feats, 3, kernel_size=3, padding=1),
+            nn.Sigmoid(),
+        )
+        self.aux_ir_decoder = nn.Sequential(
+            nn.Conv2d(n_feats, n_feats, kernel_size=3, padding=1),
+            nn.LeakyReLU(0.1, inplace=True),
+            nn.Conv2d(n_feats, 3, kernel_size=3, padding=1),
+            nn.Sigmoid(),
+        )
+
         # --- Gaussian prediction head (reused from ContinuousSR) ---
         self.ps = nn.PixelUnshuffle(2)  # 64ch -> 256ch, spatial /2
         self.conv1 = nn.Conv2d(256, 512, kernel_size=3, padding=1)
@@ -137,6 +153,7 @@ class GaussianFusion(nn.Module):
         self.background = None  # Lazy init on correct device
         self._temporal_reg_loss = None
         self._temporal_stats = {}
+        self._aux_outputs = {}
 
     def encode(self, vis, ir):
         """
@@ -366,6 +383,15 @@ class GaussianFusion(nn.Module):
         ir_reg_loss = self.temporal_attn.last_reg_loss
         ir_stats = dict(getattr(self.temporal_attn, '_debug_stats', {}))
 
+        # Auxiliary modality reconstruction at intermediate time τ. These are
+        # supervised during training and ignored by the final inference output.
+        aux_vis_tau = self.aux_vis_decoder(feat_vis_tau)
+        aux_ir_tau = self.aux_ir_decoder(feat_ir_tau)
+        self._aux_outputs = {
+            'vis_tau': aux_vis_tau,
+            'ir_tau': aux_ir_tau,
+        }
+
         if vis_reg_loss is not None and ir_reg_loss is not None:
             self._temporal_reg_loss = 0.5 * (vis_reg_loss + ir_reg_loss)
         else:
@@ -375,6 +401,9 @@ class GaussianFusion(nn.Module):
             self._temporal_stats[f'temporal_vis_{k}'] = v
         for k, v in ir_stats.items():
             self._temporal_stats[f'temporal_ir_{k}'] = v
+        with torch.no_grad():
+            self._temporal_stats['aux_vis_mean'] = aux_vis_tau.mean().item()
+            self._temporal_stats['aux_ir_mean'] = aux_ir_tau.mean().item()
 
         # --- Step 5: Cross-modal fusion ---
         feat_fused = self.fusion(feat_vis_tau, feat_ir_tau)  # [B, 64, H, W]
@@ -389,3 +418,7 @@ class GaussianFusion(nn.Module):
     def get_temporal_regularization(self):
         """Return the latest differentiable temporal anti-collapse loss."""
         return self._temporal_reg_loss
+
+    def get_aux_outputs(self):
+        """Return latest auxiliary visible/infrared reconstructions."""
+        return self._aux_outputs

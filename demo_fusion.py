@@ -82,7 +82,11 @@ def load_model(model_path, config_path, device):
 
     ckpt = torch.load(model_path, map_location=device)
     state = ckpt['model'] if isinstance(ckpt, dict) and 'model' in ckpt else ckpt
-    model.load_state_dict(state)
+    incompatible = model.load_state_dict(state, strict=False)
+    if incompatible.missing_keys:
+        print(f'Warning: missing checkpoint keys initialized randomly: {incompatible.missing_keys}')
+    if incompatible.unexpected_keys:
+        print(f'Warning: ignored unexpected checkpoint keys: {incompatible.unexpected_keys}')
     model.eval()
     return model
 
