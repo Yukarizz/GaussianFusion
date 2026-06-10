@@ -53,11 +53,13 @@ class GaussianFusion(nn.Module):
     """
 
     def __init__(self, encoder_spec, spynet_pretrained='sintel-final',
-                 n_feats=64, freeze_spynet=True, occ_threshold=1.0):
+                 n_feats=64, freeze_spynet=True, occ_threshold=1.0,
+                 gaussian_render_mode='blend'):
         super().__init__()
 
         self.n_feats = n_feats
         self.occ_threshold = occ_threshold
+        self.gaussian_render_mode = gaussian_render_mode
         self.BLOCK_H, self.BLOCK_W = 16, 16
 
         # --- SpyNet for optical flow ---
@@ -155,6 +157,15 @@ class GaussianFusion(nn.Module):
         self._temporal_stats = {}
         self._aux_outputs = {}
 
+    def _expand_tau(self, tau, bs, device):
+        if tau is None:
+            return None
+        if not isinstance(tau, torch.Tensor):
+            return torch.full((bs,), float(tau), device=device)
+        if tau.dim() == 0:
+            return tau.to(device).reshape(1).expand(bs)
+        return tau.to(device).reshape(-1)
+
     def encode(self, vis, ir):
         """
         Encode visible and infrared images through dual-branch encoder.
@@ -177,21 +188,10 @@ class GaussianFusion(nn.Module):
 
         return feat_vis, feat_ir
 
-    @torch.cuda.amp.custom_fwd(cast_inputs=torch.float32)
-    def _render_gaussians(self, feat, scale_h, scale_w, lr_h, lr_w, tau=None):
-        """
-        Gaussian rendering with optional τ conditioning (FiLM modulation).
-        """
-        feat = feat.float()  # gsplat kernels require FP32
+    def _make_gaussian_features(self, feat, scale_h, scale_w, tau=None):
+        """Convert dense feature maps into per-Gaussian latent vectors."""
+        feat = feat.float()
         bs, C, fh, fw = feat.shape
-        H = round(lr_h * scale_h)  # Target HR height
-        W = round(lr_w * scale_w)  # Target HR width
-
-        tile_bounds = (
-            (W + self.BLOCK_W - 1) // self.BLOCK_W,
-            (H + self.BLOCK_H - 1) // self.BLOCK_H,
-            1,
-        )
 
         # PixelUnshuffle to get richer per-point features.
         # For scale=1 this keeps the original compact point set. For SR rendering
@@ -201,13 +201,8 @@ class GaussianFusion(nn.Module):
         feat_ps = self.ps(feat)  # [B, C*4, fh/2, fw/2] = [B, 256, fh/2, fw/2]
 
         # τ FiLM modulation: condition Gaussian features on temporal position
-        if tau is not None:
-            if not isinstance(tau, torch.Tensor):
-                tau_t = torch.tensor([tau], device=feat.device).expand(bs)
-            elif tau.dim() == 0:
-                tau_t = tau.unsqueeze(0).expand(bs)
-            else:
-                tau_t = tau.to(feat.device)
+        tau_t = self._expand_tau(tau, bs, feat.device)
+        if tau_t is not None:
             tau_emb = self.tau_embed(tau_t.float())  # [B, 64]
             film_params = self.tau_film(tau_emb)     # [B, 512]
             gamma = film_params[:, :256].unsqueeze(-1).unsqueeze(-1) + 1.0  # [B, 256, 1, 1]
@@ -218,6 +213,11 @@ class GaussianFusion(nn.Module):
         if dense_sr_render:
             feat_ps = F.interpolate(feat_ps, size=(fh, fw), mode='nearest')
 
+        return feat_ps, dense_sr_render
+
+    def _predict_gaussian_params(self, feat_ps):
+        """Predict color, covariance, and local offset for each Gaussian."""
+        bs = feat_ps.shape[0]
         ps_h, ps_w = feat_ps.shape[2], feat_ps.shape[3]
         n_gaussians = ps_h * ps_w
 
@@ -242,25 +242,59 @@ class GaussianFusion(nn.Module):
         # Offset
         offset_all = torch.tanh(self.mlp_offset(feat_flat)).reshape(bs, n_gaussians, 2)
 
-        # Rasterize per batch
-        if self.background is None or self.background.device != feat.device:
-            self.background = torch.zeros(3, device=feat.device)
+        return {
+            'color': color_all,
+            'cov': cov_all,
+            'offset': offset_all,
+            'ps_h': ps_h,
+            'ps_w': ps_w,
+            'n_gaussians': n_gaussians,
+        }
 
-        # Coordinate grid matching the actual Gaussian feature grid. In SR mode
-        # this is densified to fh×fw, otherwise it stays at fh/2×fw/2.
-        coords = get_coord(ps_h, ps_w).to(feat.device)  # [n_gaussians, 2] in [-1, 1]
-        opacity = torch.ones(n_gaussians, 1, device=feat.device)
+    def _base_xyz(self, offset_all, ps_h, ps_w, H, W):
+        bs = offset_all.shape[0]
+        coords = get_coord(ps_h, ps_w).to(offset_all.device)
+        coords = coords.unsqueeze(0).expand(bs, -1, -1)
+        xyz_x = coords[:, :, 0:1] + 2 * offset_all[:, :, 0:1] / ps_w - 1 / W
+        xyz_y = coords[:, :, 1:2] + 2 * offset_all[:, :, 1:2] / ps_h - 1 / H
+        return torch.cat((xyz_x, xyz_y), dim=2)
+
+    def _flow_to_gaussian_grid(self, flow, ps_h, ps_w):
+        flow_ps = F.interpolate(flow, size=(ps_h, ps_w), mode='bilinear', align_corners=True)
+        return flow_ps.permute(0, 2, 3, 1).reshape(flow.shape[0], ps_h * ps_w, 2)
+
+    def _apply_flow_motion(self, xyz, flow, tau_weight, ps_h, ps_w):
+        flow_flat = self._flow_to_gaussian_grid(flow, ps_h, ps_w)
+        if not isinstance(tau_weight, torch.Tensor):
+            tau_weight = torch.tensor(tau_weight, device=xyz.device, dtype=xyz.dtype)
+        tau_weight = tau_weight.to(device=xyz.device, dtype=xyz.dtype).view(-1, 1, 1)
+        disp_x = 2 * tau_weight * flow_flat[:, :, 0:1] / ps_w
+        disp_y = 2 * tau_weight * flow_flat[:, :, 1:2] / ps_h
+        return xyz + torch.cat((disp_x, disp_y), dim=2)
+
+    @torch.cuda.amp.custom_fwd(cast_inputs=torch.float32)
+    def _render_gaussian_params(self, color_all, cov_all, xyz_all, opacity_all,
+                                scale_h, scale_w, H, W, dense_sr_render,
+                                debug_tag='gaussian'):
+        """Rasterize already-positioned Gaussian parameters."""
+        bs, n_gaussians = color_all.shape[:2]
+
+        # Rasterize per batch
+        if self.background is None or self.background.device != color_all.device:
+            self.background = torch.zeros(3, device=color_all.device)
+
+        tile_bounds = (
+            (W + self.BLOCK_W - 1) // self.BLOCK_W,
+            (H + self.BLOCK_H - 1) // self.BLOCK_H,
+            1,
+        )
 
         pred = []
         for i in range(bs):
             color_i = color_all[i]    # [n_gaussians, 3]
             cov_i = cov_all[i]        # [n_gaussians, 3]
-            offset_i = offset_all[i]  # [n_gaussians, 2]
-
-            # Apply offset (same as ContinuousSR)
-            xyz_x = coords[:, 0:1] + 2 * offset_i[:, 0:1] / ps_w - 1 / W
-            xyz_y = coords[:, 1:2] + 2 * offset_i[:, 1:2] / ps_h - 1 / H
-            xyz = torch.cat((xyz_x, xyz_y), dim=1)
+            xyz = xyz_all[i]          # [n_gaussians, 2]
+            opacity = opacity_all[i]  # [n_gaussians, 1]
 
             # Scale covariance. In SR mode, a fixed 0.5px footprint is too small
             # for the enlarged canvas and can leave periodic uncovered pixels.
@@ -299,6 +333,7 @@ class GaussianFusion(nn.Module):
             # Store debug stats (first batch item only)
             if i == 0:
                 self._debug_stats = {
+                    'render_mode_motion': float(debug_tag == 'motion'),
                     'radii_min': radii.min().item(),
                     'radii_max': radii.max().item(),
                     'radii_zero_frac': (radii == 0).float().mean().item(),
@@ -307,11 +342,83 @@ class GaussianFusion(nn.Module):
                     'cholesky_L22_min': weighted_cholesky[:, 2].min().item(),
                     'cholesky_L22_max': weighted_cholesky[:, 2].max().item(),
                     'color_mean': color_i.mean().item(),
+                    'opacity_mean': opacity.mean().item(),
                     'n_gaussians': n_gaussians,
                     'dense_sr_render': float(dense_sr_render),
                 }
 
         return torch.cat(pred, dim=0)  # [B, 3, H, W]
+
+    @torch.cuda.amp.custom_fwd(cast_inputs=torch.float32)
+    def _render_gaussians(self, feat, scale_h, scale_w, lr_h, lr_w, tau=None):
+        """
+        Original feature-blending Gaussian rendering path with optional τ FiLM.
+        """
+        H = round(lr_h * scale_h)
+        W = round(lr_w * scale_w)
+        feat_ps, dense_sr_render = self._make_gaussian_features(feat, scale_h, scale_w, tau=tau)
+        params = self._predict_gaussian_params(feat_ps)
+        xyz = self._base_xyz(params['offset'], params['ps_h'], params['ps_w'], H, W)
+        opacity = torch.ones(
+            params['color'].shape[0], params['n_gaussians'], 1,
+            device=params['color'].device, dtype=params['color'].dtype
+        )
+        return self._render_gaussian_params(
+            params['color'], params['cov'], xyz, opacity,
+            scale_h, scale_w, H, W, dense_sr_render, debug_tag='blend'
+        )
+
+    @torch.cuda.amp.custom_fwd(cast_inputs=torch.float32)
+    def _render_motion_gaussians(self, feat_fused_0, feat_fused_N, flow_01, flow_10,
+                                 scale_h, scale_w, lr_h, lr_w, tau):
+        """
+        Motion-aware Gaussian rendering.
+
+        Each endpoint predicts its own Gaussian primitives. Their centers are
+        explicitly displaced by optical flow to time τ before both primitive
+        sets are splatted onto the target canvas.
+        """
+        bs = feat_fused_0.shape[0]
+        device = feat_fused_0.device
+        H = round(lr_h * scale_h)
+        W = round(lr_w * scale_w)
+        tau_t = self._expand_tau(tau, bs, device)
+        one_minus_tau = 1.0 - tau_t
+
+        feat_ps_0, dense0 = self._make_gaussian_features(
+            feat_fused_0, scale_h, scale_w, tau=torch.zeros_like(tau_t)
+        )
+        feat_ps_N, denseN = self._make_gaussian_features(
+            feat_fused_N, scale_h, scale_w, tau=torch.ones_like(tau_t)
+        )
+        params0 = self._predict_gaussian_params(feat_ps_0)
+        paramsN = self._predict_gaussian_params(feat_ps_N)
+
+        ps_h, ps_w = params0['ps_h'], params0['ps_w']
+        xyz0 = self._base_xyz(params0['offset'], ps_h, ps_w, H, W)
+        xyzN = self._base_xyz(paramsN['offset'], ps_h, ps_w, H, W)
+        xyz0 = self._apply_flow_motion(xyz0, flow_01, tau_t, ps_h, ps_w)
+        xyzN = self._apply_flow_motion(xyzN, flow_10, one_minus_tau, ps_h, ps_w)
+
+        opacity0 = one_minus_tau.view(bs, 1, 1).expand(-1, params0['n_gaussians'], 1)
+        opacityN = tau_t.view(bs, 1, 1).expand(-1, paramsN['n_gaussians'], 1)
+
+        color = torch.cat([params0['color'], paramsN['color']], dim=1)
+        cov = torch.cat([params0['cov'], paramsN['cov']], dim=1)
+        xyz = torch.cat([xyz0, xyzN], dim=1)
+        opacity = torch.cat([opacity0, opacityN], dim=1).to(color.dtype)
+
+        with torch.no_grad():
+            flow01_grid = self._flow_to_gaussian_grid(flow_01, ps_h, ps_w)
+            flow10_grid = self._flow_to_gaussian_grid(flow_10, ps_h, ps_w)
+            self._temporal_stats['motion_flow01_abs_mean'] = flow01_grid.abs().mean().item()
+            self._temporal_stats['motion_flow10_abs_mean'] = flow10_grid.abs().mean().item()
+            self._temporal_stats['motion_tau_mean'] = tau_t.mean().item()
+
+        return self._render_gaussian_params(
+            color, cov, xyz, opacity,
+            scale_h, scale_w, H, W, dense0 or denseN, debug_tag='motion'
+        )
 
     def forward(self, vis_0, ir_0, vis_N, ir_N, scale, tau):
         """
@@ -405,11 +512,19 @@ class GaussianFusion(nn.Module):
             self._temporal_stats['aux_vis_mean'] = aux_vis_tau.mean().item()
             self._temporal_stats['aux_ir_mean'] = aux_ir_tau.mean().item()
 
-        # --- Step 5: Cross-modal fusion ---
-        feat_fused = self.fusion(feat_vis_tau, feat_ir_tau)  # [B, 64, H, W]
-
-        # --- Step 6: Gaussian rendering at target scale (τ-conditioned) ---
-        output = self._render_gaussians(feat_fused, scale_h, scale_w, lr_h, lr_w, tau=tau)
+        # --- Step 5/6: Cross-modal fusion and Gaussian rendering ---
+        if self.gaussian_render_mode == 'motion':
+            # Fuse each endpoint first, then move endpoint Gaussians along flow.
+            feat_fused_0 = self.fusion(feat_vis_0, feat_ir_0)
+            feat_fused_N = self.fusion(feat_vis_N, feat_ir_N)
+            output = self._render_motion_gaussians(
+                feat_fused_0, feat_fused_N, flow_01, flow_10,
+                scale_h, scale_w, lr_h, lr_w, tau=tau
+            )
+        else:
+            # Backward-compatible path: interpolate features, fuse, then render.
+            feat_fused = self.fusion(feat_vis_tau, feat_ir_tau)  # [B, 64, H, W]
+            output = self._render_gaussians(feat_fused, scale_h, scale_w, lr_h, lr_w, tau=tau)
         if hasattr(self, '_debug_stats'):
             self._debug_stats.update(self._temporal_stats)
 
