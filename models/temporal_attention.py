@@ -119,30 +119,29 @@ class TemporalCrossAttention(nn.Module):
             t_b = float(tau)
             tau_flat = torch.tensor([tau], device=feat_0.device).expand(B)
 
-        # Step 1: Warp features to time τ using flow
-        
-        # flow_0t = t_b * flow_01
-        # flow_1t = (1 - t_b) * flow_10
-        # warped_0 = flow_warp(feat_0, flow_0t)  # [B, C, H, W]
-        # warped_1 = flow_warp(feat_1, flow_1t)  # [B, C, H, W]
 
-        # Step 1: Warp features to time τ using Super-SloMo quadratic flow approximation
-        # Super-SloMo estimates intermediate backward flows:
-        #   F_t_0 = -t(1-t) * F_0_1 + t^2       * F_1_0
-        #   F_t_1 = (1-t)^2  * F_0_1 - t(1-t)   * F_1_0
-        #
-        # These flows are then used to backwarp frame/feature 0 and frame/feature 1
-        # into the intermediate time t.
         t = t_b
         one_minus_t = 1.0 - t
         temp = -t * one_minus_t
 
-        flow_t0 = temp * flow_01 + (t * t) * flow_10
-        flow_t1 = (one_minus_t * one_minus_t) * flow_01 + temp * flow_10
+        # 1.1 Calculate basic Super-SloMo approximate flows
+        # These flows are mathematically sound in magnitude, but spatially misaligned
+        flow_t0_approx = temp * flow_01 + (t * t) * flow_10
+        flow_t1_approx = (one_minus_t * one_minus_t) * flow_01 + temp * flow_10
 
-        warped_0 = flow_warp(feat_0, flow_t0)  # [B, C, H, W]
-        warped_1 = flow_warp(feat_1, flow_t1)  # [B, C, H, W]
-        
+        # 1.2 Warp the base flows to align them to the intermediate grid t
+        # We use the approximate intermediate flows to fetch the true vectors from anchor frames
+        flow_01_at_t = flow_warp(flow_01, flow_t0_approx)
+        flow_10_at_t = flow_warp(flow_10, flow_t1_approx)
+
+        # 1.3 Recalculate accurate intermediate flows using the spatially aligned base flows
+        flow_t0_aligned = temp * flow_01_at_t + (t * t) * flow_10_at_t
+        flow_t1_aligned = (one_minus_t * one_minus_t) * flow_01_at_t + temp * flow_10_at_t
+
+        # 1.4 Finally, warp the image features using the perfectly aligned flows
+        warped_0 = flow_warp(feat_0, flow_t0_aligned)  # [B, C, H, W]
+        warped_1 = flow_warp(feat_1, flow_t1_aligned)  # [B, C, H, W]
+
         # Step 2: τ conditioning
         tau_emb = self.tau_embed(tau_flat)       # [B, tau_dim]
         tau_feat = self.tau_mlp(tau_emb)         # [B, n_feats]
