@@ -22,6 +22,7 @@ model:
     n_feats: 64
     freeze_spynet: true
     occ_threshold: 5.0
+    gaussian_render_mode: motion
 
 # Training dataset
 train_dataset:
@@ -51,6 +52,6 @@ val_every: 1
 lambda_int: 1.0
 lambda_color: 1.0
 lambda_grad: 2.0
-lambda_temporal: 0.0
-lambda_aux_vis: 0.2
-lambda_aux_ir: 0.2
+lambda_temporal: 0.1
+lambda_aux_vis: 0.5
+lambda_aux_ir: 0.5
