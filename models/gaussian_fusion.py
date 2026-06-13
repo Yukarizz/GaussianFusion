@@ -54,12 +54,15 @@ class GaussianFusion(nn.Module):
 
     def __init__(self, encoder_spec, spynet_pretrained='sintel-final',
                  n_feats=64, freeze_spynet=True, occ_threshold=1.0,
-                 gaussian_render_mode='blend'):
+                 gaussian_render_mode='blend', fb_confidence_scale=None,
+                 tau_gaussian_opacity=0.5):
         super().__init__()
 
         self.n_feats = n_feats
         self.occ_threshold = occ_threshold
         self.gaussian_render_mode = gaussian_render_mode
+        self.fb_confidence_scale = fb_confidence_scale or occ_threshold
+        self.tau_gaussian_opacity = tau_gaussian_opacity
         self.BLOCK_H, self.BLOCK_W = 16, 16
 
         # --- SpyNet for optical flow ---
@@ -143,6 +146,11 @@ class GaussianFusion(nn.Module):
             nn.GELU(),
             nn.Linear(256, 256 * 2),  # γ and β for FiLM on 256-ch features
         )
+        self.cov_tau_mod = nn.Sequential(
+            nn.Linear(64, 64),
+            nn.GELU(),
+            nn.Linear(64, 6),  # γ and β for [L11, L21, L22]
+        )
 
         # Pre-defined Gaussian covariance dictionary (730 templates)
         cho1 = torch.tensor([0, 0.41, 0.62, 0.98, 1.13, 1.29, 1.64, 1.85, 2.36])
@@ -215,7 +223,7 @@ class GaussianFusion(nn.Module):
 
         return feat_ps, dense_sr_render
 
-    def _predict_gaussian_params(self, feat_ps):
+    def _predict_gaussian_params(self, feat_ps, tau=None):
         """Predict color, covariance, and local offset for each Gaussian."""
         bs = feat_ps.shape[0]
         ps_h, ps_w = feat_ps.shape[2], feat_ps.shape[3]
@@ -238,6 +246,13 @@ class GaussianFusion(nn.Module):
         similarity = vector @ para_flat.t()  # [730, B*n_gaussians]
         weights = torch.softmax(similarity, dim=0)  # [730, B*n_gaussians]
         cov_all = (weights.t() @ self.gau_dict).reshape(bs, n_gaussians, 3)
+        tau_t = self._expand_tau(tau, bs, feat_ps.device)
+        if tau_t is not None:
+            tau_emb = self.tau_embed(tau_t.float())
+            cov_mod = self.cov_tau_mod(tau_emb)
+            cov_gamma = 1.0 + 0.1 * torch.tanh(cov_mod[:, :3]).unsqueeze(1)
+            cov_beta = 0.1 * torch.tanh(cov_mod[:, 3:]).unsqueeze(1)
+            cov_all = cov_all * cov_gamma + cov_beta
 
         # Offset
         offset_all = torch.tanh(self.mlp_offset(feat_flat)).reshape(bs, n_gaussians, 2)
@@ -262,6 +277,21 @@ class GaussianFusion(nn.Module):
     def _flow_to_gaussian_grid(self, flow, ps_h, ps_w):
         flow_ps = F.interpolate(flow, size=(ps_h, ps_w), mode='bilinear', align_corners=True)
         return flow_ps.permute(0, 2, 3, 1).reshape(flow.shape[0], ps_h * ps_w, 2)
+
+    def _compute_fb_confidence(self, flow_01, flow_10):
+        """Continuous forward-backward confidence maps for both endpoints."""
+        flow_10_at_1 = flow_warp(flow_10, flow_01)
+        flow_01_at_0 = flow_warp(flow_01, flow_10)
+        cons_0 = torch.norm(flow_01 + flow_10_at_1, dim=1, keepdim=True)
+        cons_1 = torch.norm(flow_10 + flow_01_at_0, dim=1, keepdim=True)
+        sigma = max(float(self.fb_confidence_scale), 1e-6)
+        conf_0 = torch.exp(-cons_0 / sigma).clamp(0.0, 1.0)
+        conf_1 = torch.exp(-cons_1 / sigma).clamp(0.0, 1.0)
+        return conf_0, conf_1, cons_0, cons_1
+
+    def _confidence_to_gaussian_grid(self, confidence, ps_h, ps_w):
+        conf_ps = F.interpolate(confidence, size=(ps_h, ps_w), mode='bilinear', align_corners=True)
+        return conf_ps.permute(0, 2, 3, 1).reshape(confidence.shape[0], ps_h * ps_w, 1)
 
     def _apply_flow_motion(self, xyz, flow, tau_weight, ps_h, ps_w):
         flow_flat = self._flow_to_gaussian_grid(flow, ps_h, ps_w)
@@ -357,7 +387,7 @@ class GaussianFusion(nn.Module):
         H = round(lr_h * scale_h)
         W = round(lr_w * scale_w)
         feat_ps, dense_sr_render = self._make_gaussian_features(feat, scale_h, scale_w, tau=tau)
-        params = self._predict_gaussian_params(feat_ps)
+        params = self._predict_gaussian_params(feat_ps, tau=tau)
         xyz = self._base_xyz(params['offset'], params['ps_h'], params['ps_w'], H, W)
         opacity = torch.ones(
             params['color'].shape[0], params['n_gaussians'], 1,
@@ -370,7 +400,8 @@ class GaussianFusion(nn.Module):
 
     @torch.cuda.amp.custom_fwd(cast_inputs=torch.float32)
     def _render_motion_gaussians(self, feat_fused_0, feat_fused_N, flow_01, flow_10,
-                                 scale_h, scale_w, lr_h, lr_w, tau):
+                                 scale_h, scale_w, lr_h, lr_w, tau,
+                                 feat_fused_tau=None):
         """
         Motion-aware Gaussian rendering.
 
@@ -386,13 +417,13 @@ class GaussianFusion(nn.Module):
         one_minus_tau = 1.0 - tau_t
 
         feat_ps_0, dense0 = self._make_gaussian_features(
-            feat_fused_0, scale_h, scale_w, tau=torch.zeros_like(tau_t)
+            feat_fused_0, scale_h, scale_w, tau=tau_t
         )
         feat_ps_N, denseN = self._make_gaussian_features(
-            feat_fused_N, scale_h, scale_w, tau=torch.ones_like(tau_t)
+            feat_fused_N, scale_h, scale_w, tau=tau_t
         )
-        params0 = self._predict_gaussian_params(feat_ps_0)
-        paramsN = self._predict_gaussian_params(feat_ps_N)
+        params0 = self._predict_gaussian_params(feat_ps_0, tau=tau_t)
+        paramsN = self._predict_gaussian_params(feat_ps_N, tau=tau_t)
 
         ps_h, ps_w = params0['ps_h'], params0['ps_w']
         xyz0 = self._base_xyz(params0['offset'], ps_h, ps_w, H, W)
@@ -400,13 +431,39 @@ class GaussianFusion(nn.Module):
         xyz0 = self._apply_flow_motion(xyz0, flow_01, tau_t, ps_h, ps_w)
         xyzN = self._apply_flow_motion(xyzN, flow_10, one_minus_tau, ps_h, ps_w)
 
-        opacity0 = one_minus_tau.view(bs, 1, 1).expand(-1, params0['n_gaussians'], 1)
-        opacityN = tau_t.view(bs, 1, 1).expand(-1, paramsN['n_gaussians'], 1)
+        conf_0, conf_N, cons_0, cons_N = self._compute_fb_confidence(flow_01, flow_10)
+        conf0_grid = self._confidence_to_gaussian_grid(conf_0, ps_h, ps_w)
+        confN_grid = self._confidence_to_gaussian_grid(conf_N, ps_h, ps_w)
+        opacity0 = one_minus_tau.view(bs, 1, 1).expand(-1, params0['n_gaussians'], 1) * conf0_grid
+        opacityN = tau_t.view(bs, 1, 1).expand(-1, paramsN['n_gaussians'], 1) * confN_grid
 
-        color = torch.cat([params0['color'], paramsN['color']], dim=1)
-        cov = torch.cat([params0['cov'], paramsN['cov']], dim=1)
-        xyz = torch.cat([xyz0, xyzN], dim=1)
-        opacity = torch.cat([opacity0, opacityN], dim=1).to(color.dtype)
+        colors = [params0['color'], paramsN['color']]
+        covs = [params0['cov'], paramsN['cov']]
+        xyzs = [xyz0, xyzN]
+        opacities = [opacity0, opacityN]
+        dense_tau = False
+
+        if feat_fused_tau is not None and self.tau_gaussian_opacity > 0:
+            feat_ps_tau, dense_tau = self._make_gaussian_features(
+                feat_fused_tau, scale_h, scale_w, tau=tau_t
+            )
+            params_tau = self._predict_gaussian_params(feat_ps_tau, tau=tau_t)
+            xyz_tau = self._base_xyz(params_tau['offset'], params_tau['ps_h'], params_tau['ps_w'], H, W)
+            midness = (1.0 - (2.0 * tau_t - 1.0).abs()).clamp(0.0, 1.0)
+            opacity_tau = (
+                self.tau_gaussian_opacity
+                * midness.view(bs, 1, 1)
+                * torch.ones(bs, params_tau['n_gaussians'], 1, device=device, dtype=params_tau['color'].dtype)
+            )
+            colors.append(params_tau['color'])
+            covs.append(params_tau['cov'])
+            xyzs.append(xyz_tau)
+            opacities.append(opacity_tau)
+
+        color = torch.cat(colors, dim=1)
+        cov = torch.cat(covs, dim=1)
+        xyz = torch.cat(xyzs, dim=1)
+        opacity = torch.cat(opacities, dim=1).to(color.dtype)
 
         with torch.no_grad():
             flow01_grid = self._flow_to_gaussian_grid(flow_01, ps_h, ps_w)
@@ -414,10 +471,17 @@ class GaussianFusion(nn.Module):
             self._temporal_stats['motion_flow01_abs_mean'] = flow01_grid.abs().mean().item()
             self._temporal_stats['motion_flow10_abs_mean'] = flow10_grid.abs().mean().item()
             self._temporal_stats['motion_tau_mean'] = tau_t.mean().item()
+            self._temporal_stats['fb_conf0_mean'] = conf_0.mean().item()
+            self._temporal_stats['fb_conf1_mean'] = conf_N.mean().item()
+            self._temporal_stats['fb_cons0_mean'] = cons_0.mean().item()
+            self._temporal_stats['fb_cons1_mean'] = cons_N.mean().item()
+            self._temporal_stats['tau_gaussian_opacity_mean'] = (
+                opacities[2].mean().item() if len(opacities) > 2 else 0.0
+            )
 
         return self._render_gaussian_params(
             color, cov, xyz, opacity,
-            scale_h, scale_w, H, W, dense0 or denseN, debug_tag='motion'
+            scale_h, scale_w, H, W, dense0 or denseN or dense_tau, debug_tag='motion'
         )
 
     def forward(self, vis_0, ir_0, vis_N, ir_N, scale, tau):
@@ -517,9 +581,11 @@ class GaussianFusion(nn.Module):
             # Fuse each endpoint first, then move endpoint Gaussians along flow.
             feat_fused_0 = self.fusion(feat_vis_0, feat_ir_0)
             feat_fused_N = self.fusion(feat_vis_N, feat_ir_N)
+            feat_fused_tau = self.fusion(feat_vis_tau, feat_ir_tau)
             output = self._render_motion_gaussians(
                 feat_fused_0, feat_fused_N, flow_01, flow_10,
-                scale_h, scale_w, lr_h, lr_w, tau=tau
+                scale_h, scale_w, lr_h, lr_w, tau=tau,
+                feat_fused_tau=feat_fused_tau
             )
         else:
             # Backward-compatible path: interpolate features, fuse, then render.

@@ -23,6 +23,8 @@ model:
     freeze_spynet: true
     occ_threshold: 5.0
     gaussian_render_mode: motion
+    fb_confidence_scale: 5.0
+    tau_gaussian_opacity: 0.5
 
 # Training dataset
 train_dataset:
