@@ -24,7 +24,11 @@ model:
     occ_threshold: 5.0
     gaussian_render_mode: motion
     fb_confidence_scale: 5.0
-    tau_gaussian_opacity: 0.5
+    fb_confidence_floor: 0.2
+    motion_force_dense: false
+    motion_dense_mode: none
+    motion_flow_smooth_kernel: 3
+    tau_gaussian_opacity: 0.0
 
 # Training dataset
 train_dataset:
@@ -34,7 +38,7 @@ train_dataset:
     split: train
     vis_modality: visible_Enhance
     ir_modality: infrared_Enhance
-    n_min: 4
+    n_min: 8
     n_max: 8
     scale_min: 1.0
     scale_max: 1.0
@@ -44,8 +48,8 @@ train_dataset:
 # Training hyperparameters
 batch_size: 16
 num_workers: 8
-epochs: 30
-warmup_epochs: 5
+epochs: 10
+warmup_epochs: 1
 lr: 1.0e-4
 weight_decay: 0
 save_every: 1

@@ -55,6 +55,9 @@ class GaussianFusion(nn.Module):
     def __init__(self, encoder_spec, spynet_pretrained='sintel-final',
                  n_feats=64, freeze_spynet=True, occ_threshold=1.0,
                  gaussian_render_mode='blend', fb_confidence_scale=None,
+                 fb_confidence_floor=0.2,
+                 motion_force_dense=False,
+                 motion_dense_mode='none', motion_flow_smooth_kernel=3,
                  tau_gaussian_opacity=0.5):
         super().__init__()
 
@@ -62,6 +65,10 @@ class GaussianFusion(nn.Module):
         self.occ_threshold = occ_threshold
         self.gaussian_render_mode = gaussian_render_mode
         self.fb_confidence_scale = fb_confidence_scale or occ_threshold
+        self.fb_confidence_floor = fb_confidence_floor
+        self.motion_force_dense = motion_force_dense
+        self.motion_dense_mode = motion_dense_mode
+        self.motion_flow_smooth_kernel = motion_flow_smooth_kernel
         self.tau_gaussian_opacity = tau_gaussian_opacity
         self.BLOCK_H, self.BLOCK_W = 16, 16
 
@@ -196,7 +203,7 @@ class GaussianFusion(nn.Module):
 
         return feat_vis, feat_ir
 
-    def _make_gaussian_features(self, feat, scale_h, scale_w, tau=None):
+    def _make_gaussian_features(self, feat, scale_h, scale_w, tau=None, dense_mode='auto'):
         """Convert dense feature maps into per-Gaussian latent vectors."""
         feat = feat.float()
         bs, C, fh, fw = feat.shape
@@ -217,8 +224,10 @@ class GaussianFusion(nn.Module):
             beta = film_params[:, 256:].unsqueeze(-1).unsqueeze(-1)         # [B, 256, 1, 1]
             feat_ps = gamma * feat_ps + beta
 
-        dense_sr_render = max(scale_h, scale_w) > 1.0
-        if dense_sr_render:
+        dense_sr_render = dense_mode in ('full', 'vertical') or max(scale_h, scale_w) > 1.0
+        if dense_mode == 'vertical':
+            feat_ps = F.interpolate(feat_ps, size=(fh, feat_ps.shape[-1]), mode='nearest')
+        elif dense_sr_render:
             feat_ps = F.interpolate(feat_ps, size=(fh, fw), mode='nearest')
 
         return feat_ps, dense_sr_render
@@ -278,6 +287,14 @@ class GaussianFusion(nn.Module):
         flow_ps = F.interpolate(flow, size=(ps_h, ps_w), mode='bilinear', align_corners=True)
         return flow_ps.permute(0, 2, 3, 1).reshape(flow.shape[0], ps_h * ps_w, 2)
 
+    def _smooth_motion_flow(self, flow):
+        kernel = int(self.motion_flow_smooth_kernel)
+        if kernel <= 1:
+            return flow
+        if kernel % 2 == 0:
+            kernel += 1
+        return F.avg_pool2d(flow, kernel_size=kernel, stride=1, padding=kernel // 2)
+
     def _compute_fb_confidence(self, flow_01, flow_10):
         """Continuous forward-backward confidence maps for both endpoints."""
         flow_10_at_1 = flow_warp(flow_10, flow_01)
@@ -285,8 +302,9 @@ class GaussianFusion(nn.Module):
         cons_0 = torch.norm(flow_01 + flow_10_at_1, dim=1, keepdim=True)
         cons_1 = torch.norm(flow_10 + flow_01_at_0, dim=1, keepdim=True)
         sigma = max(float(self.fb_confidence_scale), 1e-6)
-        conf_0 = torch.exp(-cons_0 / sigma).clamp(0.0, 1.0)
-        conf_1 = torch.exp(-cons_1 / sigma).clamp(0.0, 1.0)
+        conf_floor = float(self.fb_confidence_floor)
+        conf_0 = torch.exp(-cons_0 / sigma).clamp(conf_floor, 1.0)
+        conf_1 = torch.exp(-cons_1 / sigma).clamp(conf_floor, 1.0)
         return conf_0, conf_1, cons_0, cons_1
 
     def _confidence_to_gaussian_grid(self, confidence, ps_h, ps_w):
@@ -298,8 +316,9 @@ class GaussianFusion(nn.Module):
         if not isinstance(tau_weight, torch.Tensor):
             tau_weight = torch.tensor(tau_weight, device=xyz.device, dtype=xyz.dtype)
         tau_weight = tau_weight.to(device=xyz.device, dtype=xyz.dtype).view(-1, 1, 1)
-        disp_x = 2 * tau_weight * flow_flat[:, :, 0:1] / ps_w
-        disp_y = 2 * tau_weight * flow_flat[:, :, 1:2] / ps_h
+        flow_h, flow_w = flow.shape[2], flow.shape[3]
+        disp_x = 2 * tau_weight * flow_flat[:, :, 0:1] / flow_w
+        disp_y = 2 * tau_weight * flow_flat[:, :, 1:2] / flow_h
         return xyz + torch.cat((disp_x, disp_y), dim=2)
 
     @torch.cuda.amp.custom_fwd(cast_inputs=torch.float32)
@@ -328,8 +347,8 @@ class GaussianFusion(nn.Module):
 
             # Scale covariance. In SR mode, a fixed 0.5px footprint is too small
             # for the enlarged canvas and can leave periodic uncovered pixels.
-            min_std_w = max(0.5, 0.5 * scale_w) if dense_sr_render else 0.5
-            min_std_h = max(0.5, 0.5 * scale_h) if dense_sr_render else 0.5
+            min_std_w = max(0.5, 0.5 * scale_w) if dense_sr_render else 0.85
+            min_std_h = max(0.5, 0.5 * scale_h) if dense_sr_render else 1.0
             L11 = cov_i[:, 0] * scale_w / 2.0 + min_std_w
             L21 = cov_i[:, 1] * scale_h / 2.0
             L22 = cov_i[:, 2] * scale_h / 2.0 + min_std_h
@@ -354,10 +373,17 @@ class GaussianFusion(nn.Module):
                 self.BLOCK_H, self.BLOCK_W,
                 background=self.background, return_alpha=False
             )
-            # Normalized output: clamp denominator to prevent explosion at
-            # low-coverage pixels (borders, offset-shifted regions)
-            out_img = out_rgb / out_w.clamp(min=1.0)
+            # Normalized output. Motion-shifted Gaussians can leave thin
+            # low-coverage rows; avoid turning those rows into hard black lines.
+            out_img = out_rgb / out_w.clamp(min=1e-6)
             out_img = out_img.permute(2, 0, 1).unsqueeze(0)  # [1, 3, H, W]
+            coverage = out_w[..., :1].permute(2, 0, 1).unsqueeze(0).clamp(0.0, 1.0)
+            low_coverage = coverage < 0.25
+            if low_coverage.any():
+                pooled_num = F.avg_pool2d(out_img * coverage, kernel_size=5, stride=1, padding=2)
+                pooled_den = F.avg_pool2d(coverage, kernel_size=5, stride=1, padding=2)
+                filled = pooled_num / pooled_den.clamp(min=1e-6)
+                out_img = torch.where(low_coverage, filled, out_img)
             pred.append(out_img)
 
             # Store debug stats (first batch item only)
@@ -373,6 +399,8 @@ class GaussianFusion(nn.Module):
                     'cholesky_L22_max': weighted_cholesky[:, 2].max().item(),
                     'color_mean': color_i.mean().item(),
                     'opacity_mean': opacity.mean().item(),
+                    'coverage_min': coverage.min().item(),
+                    'coverage_low_frac': low_coverage.float().mean().item(),
                     'n_gaussians': n_gaussians,
                     'dense_sr_render': float(dense_sr_render),
                 }
@@ -415,21 +443,30 @@ class GaussianFusion(nn.Module):
         W = round(lr_w * scale_w)
         tau_t = self._expand_tau(tau, bs, device)
         one_minus_tau = 1.0 - tau_t
+        rel_tau_0 = tau_t
+        rel_tau_N = tau_t - 1.0
+        rel_tau_target = torch.zeros_like(tau_t)
+        if self.motion_force_dense or max(scale_h, scale_w) > 1.0:
+            dense_mode = 'full'
+        else:
+            dense_mode = self.motion_dense_mode
+        motion_flow_01 = self._smooth_motion_flow(flow_01)
+        motion_flow_10 = self._smooth_motion_flow(flow_10)
 
         feat_ps_0, dense0 = self._make_gaussian_features(
-            feat_fused_0, scale_h, scale_w, tau=tau_t
+            feat_fused_0, scale_h, scale_w, tau=rel_tau_0, dense_mode=dense_mode
         )
         feat_ps_N, denseN = self._make_gaussian_features(
-            feat_fused_N, scale_h, scale_w, tau=tau_t
+            feat_fused_N, scale_h, scale_w, tau=rel_tau_N, dense_mode=dense_mode
         )
-        params0 = self._predict_gaussian_params(feat_ps_0, tau=tau_t)
-        paramsN = self._predict_gaussian_params(feat_ps_N, tau=tau_t)
+        params0 = self._predict_gaussian_params(feat_ps_0, tau=rel_tau_0)
+        paramsN = self._predict_gaussian_params(feat_ps_N, tau=rel_tau_N)
 
         ps_h, ps_w = params0['ps_h'], params0['ps_w']
         xyz0 = self._base_xyz(params0['offset'], ps_h, ps_w, H, W)
         xyzN = self._base_xyz(paramsN['offset'], ps_h, ps_w, H, W)
-        xyz0 = self._apply_flow_motion(xyz0, flow_01, tau_t, ps_h, ps_w)
-        xyzN = self._apply_flow_motion(xyzN, flow_10, one_minus_tau, ps_h, ps_w)
+        xyz0 = self._apply_flow_motion(xyz0, motion_flow_01, tau_t, ps_h, ps_w)
+        xyzN = self._apply_flow_motion(xyzN, motion_flow_10, one_minus_tau, ps_h, ps_w)
 
         conf_0, conf_N, cons_0, cons_N = self._compute_fb_confidence(flow_01, flow_10)
         conf0_grid = self._confidence_to_gaussian_grid(conf_0, ps_h, ps_w)
@@ -445,9 +482,9 @@ class GaussianFusion(nn.Module):
 
         if feat_fused_tau is not None and self.tau_gaussian_opacity > 0:
             feat_ps_tau, dense_tau = self._make_gaussian_features(
-                feat_fused_tau, scale_h, scale_w, tau=tau_t
+                feat_fused_tau, scale_h, scale_w, tau=rel_tau_target, dense_mode=dense_mode
             )
-            params_tau = self._predict_gaussian_params(feat_ps_tau, tau=tau_t)
+            params_tau = self._predict_gaussian_params(feat_ps_tau, tau=rel_tau_target)
             xyz_tau = self._base_xyz(params_tau['offset'], params_tau['ps_h'], params_tau['ps_w'], H, W)
             midness = (1.0 - (2.0 * tau_t - 1.0).abs()).clamp(0.0, 1.0)
             opacity_tau = (
@@ -471,6 +508,8 @@ class GaussianFusion(nn.Module):
             self._temporal_stats['motion_flow01_abs_mean'] = flow01_grid.abs().mean().item()
             self._temporal_stats['motion_flow10_abs_mean'] = flow10_grid.abs().mean().item()
             self._temporal_stats['motion_tau_mean'] = tau_t.mean().item()
+            self._temporal_stats['motion_rel_tau0_mean'] = rel_tau_0.mean().item()
+            self._temporal_stats['motion_rel_tauN_mean'] = rel_tau_N.mean().item()
             self._temporal_stats['fb_conf0_mean'] = conf_0.mean().item()
             self._temporal_stats['fb_conf1_mean'] = conf_N.mean().item()
             self._temporal_stats['fb_cons0_mean'] = cons_0.mean().item()
