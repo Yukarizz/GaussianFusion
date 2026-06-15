@@ -19,6 +19,72 @@ from models.temporal_attention import SinusoidalPosEmb
 from gsplat.project_gaussians_2d import project_gaussians_2d
 from gsplat.rasterize_sum import rasterize_gaussians_sum
 
+class Sine(nn.Module):
+    """SIREN 核心激活函数"""
+    def __init__(self, w0=30.0):
+        super().__init__()
+        self.w0 = w0
+
+    def forward(self, x):
+        return torch.sin(self.w0 * x)
+
+class MotionAwareWindowScorer(nn.Module):
+    """
+    通过 SIRENs 从端点特征学习运动权重图 V_map (带严格的 SIREN 初始化)
+    """
+    def __init__(self, in_channels=64, num_windows=10, hidden_dim=64):
+        super().__init__()
+        
+        # 为了方便独立初始化，我们将 Sequential 拆解
+        self.conv1 = nn.Conv2d(in_channels * 2, hidden_dim, 1)
+        self.sine1 = Sine(w0=30.0)
+        
+        self.conv2 = nn.Conv2d(hidden_dim, hidden_dim, 1)
+        self.sine2 = Sine(w0=1.0)
+        
+        self.conv3 = nn.Conv2d(hidden_dim, num_windows, 1)
+        
+        # 执行 SIREN 专属权重初始化
+        self._init_weights()
+
+    def _init_weights(self):
+        with torch.no_grad():
+            # ==========================================
+            # 1. 第一层初始化
+            # 公式: U(-1 / fan_in, 1 / fan_in)
+            # ==========================================
+            fan_in_1 = self.conv1.in_channels
+            self.conv1.weight.uniform_(-1 / fan_in_1, 1 / fan_in_1)
+            if self.conv1.bias is not None:
+                self.conv1.bias.uniform_(-1 / fan_in_1, 1 / fan_in_1)
+
+            # ==========================================
+            # 2. 隐藏层初始化
+            # 公式: U(-sqrt(6 / fan_in) / w0, sqrt(6 / fan_in) / w0)
+            # 注意: 这里的 w0 必须是**前一层**激活函数使用的 w0 (即 30.0)
+            # ==========================================
+            fan_in_2 = self.conv2.in_channels
+            bound_2 = math.sqrt(6 / fan_in_2) / 30.0
+            self.conv2.weight.uniform_(-bound_2, bound_2)
+            if self.conv2.bias is not None:
+                self.conv2.bias.uniform_(-bound_2, bound_2)
+
+            # ==========================================
+            # 3. 输出层初始化
+            # 因为前一层的 sine2 使用的是 w0=1.0，所以这里除以 1.0
+            # ==========================================
+            fan_in_3 = self.conv3.in_channels
+            bound_3 = math.sqrt(6 / fan_in_3) / 1.0
+            self.conv3.weight.uniform_(-bound_3, bound_3)
+            if self.conv3.bias is not None:
+                self.conv3.bias.uniform_(-bound_3, bound_3)
+
+    def forward(self, feat_0, feat_1):
+        x = torch.cat([feat_0, feat_1], dim=1) 
+        x = self.sine1(self.conv1(x))
+        x = self.sine2(self.conv2(x))
+        logits = self.conv3(x)
+        return torch.softmax(logits, dim=1)
 
 def get_coord(width, height):
     """Generate normalized coordinate grid in [-1, 1]."""
@@ -134,17 +200,22 @@ class GaussianFusion(nn.Module):
         }}
         self.mlp_vector = models.make(mlp_vector_spec)
 
-        # MLP for color prediction
-        mlp_color_spec = {'name': 'mlp', 'args': {
-            'in_dim': 256, 'out_dim': 3, 'hidden_list': [512, 1024, 256, 128, 64]
-        }}
-        self.mlp_color = models.make(mlp_color_spec)
-
-        # MLP for offset prediction
-        mlp_offset_spec = {'name': 'mlp', 'args': {
-            'in_dim': 256, 'out_dim': 2, 'hidden_list': [512, 1024, 256, 128, 64]
-        }}
-        self.mlp_offset = models.make(mlp_offset_spec)
+        # Convolutional heads for color and offset prediction. A signed relative
+        # tau channel is concatenated with feat_ps so endpoint direction remains explicit.
+        self.conv_color = nn.Sequential(
+            nn.Conv2d(257, 256, kernel_size=3, padding=1),
+            nn.LeakyReLU(0.1, inplace=True),
+            nn.Conv2d(256, 128, kernel_size=3, padding=1),
+            nn.LeakyReLU(0.1, inplace=True),
+            nn.Conv2d(128, 3, kernel_size=1),
+        )
+        self.conv_offset = nn.Sequential(
+            nn.Conv2d(257, 256, kernel_size=3, padding=1),
+            nn.LeakyReLU(0.1, inplace=True),
+            nn.Conv2d(256, 128, kernel_size=3, padding=1),
+            nn.LeakyReLU(0.1, inplace=True),
+            nn.Conv2d(128, 2, kernel_size=1),
+        )
 
         # --- τ conditioning for Gaussian head (FiLM modulation) ---
         self.tau_embed = SinusoidalPosEmb(64)
@@ -167,10 +238,31 @@ class GaussianFusion(nn.Module):
         gau_dict = torch.cat((gau_dict, torch.zeros(1, 3)), dim=0)  # [730, 3]
         self.register_buffer('gau_dict', gau_dict)
 
+        num_prior_kernels = self.gau_dict.shape[0] 
+        
+        self.cram_projection = nn.Sequential(
+            nn.Linear(num_prior_kernels * 2 + 1, 256),
+            nn.LeakyReLU(0.1, inplace=True),
+            nn.Linear(256, num_prior_kernels) # 输出融合后的新打分
+        )
         self.background = None  # Lazy init on correct device
         self._temporal_reg_loss = None
         self._temporal_stats = {}
         self._aux_outputs = {}
+        
+        # =======================================================
+        # 新增：Motion-Aware Adaptive Offset Window (AOW) 依据原文重写
+        # =======================================================
+        # 1. 预设 10 个离散的窗口大小 (原文：S_win = {1, 2, ..., 10})
+        # 注意：这里的 1 到 10 指的是像素级别。为了方便后续与 tanh() 结合，
+        # 我们可能需要调整它的尺度，但为了严谨复现，先保留 1-10。
+        window_sizes = torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0])
+        # 必须变成 [1, 10, 1, 1] 方便后面直接做张量广播乘法
+        self.register_buffer('window_bank', window_sizes.view(1, -1, 1, 1))
+        
+        # 2. 注册基于 SIREN 的打分网络
+        # 假设你的特征维度 n_feats = 64
+        self.window_scorer = MotionAwareWindowScorer(in_channels=self.n_feats, num_windows=10)
 
     def _expand_tau(self, tau, bs, device):
         if tau is None:
@@ -241,9 +333,20 @@ class GaussianFusion(nn.Module):
         # Reshape: [B, 256, ps_h, ps_w] -> [B*ps_h*ps_w, 256]
         feat_flat = feat_ps.permute(0, 2, 3, 1).reshape(bs * n_gaussians, 256)
 
+        tau_t = self._expand_tau(tau, bs, feat_ps.device)
+        if tau_t is None:
+            tau_channel = feat_ps.new_zeros(bs, 1, ps_h, ps_w)
+        else:
+            tau_channel = tau_t.to(device=feat_ps.device, dtype=feat_ps.dtype).view(bs, 1, 1, 1)
+            tau_channel = tau_channel.expand(-1, 1, ps_h, ps_w)
+        param_feat = torch.cat([feat_ps, tau_channel], dim=1)
+
         # Color (sigmoid with -2 shift: init at sigmoid(-2)≈0.12, below typical targets)
         # Forces gradient to push UP (away from sigmoid saturation at 0)
-        color_all = torch.sigmoid(self.mlp_color(feat_flat) - 2.0).reshape(bs, n_gaussians, 3)
+        color_map = self.conv_color(param_feat)
+        color_all = torch.sigmoid(
+            color_map.permute(0, 2, 3, 1).reshape(bs, n_gaussians, 3) - 2.0
+        )
 
         # Covariance via dictionary (same mechanism as ContinuousSR)
         # Detach features to prevent encoder side-effects on covariance
@@ -253,22 +356,41 @@ class GaussianFusion(nn.Module):
 
         vector = self.mlp_vector(self.gau_dict)  # [730, 512]
         similarity = vector @ para_flat.t()  # [730, B*n_gaussians]
+        # 对先验字典的打分权重
         weights = torch.softmax(similarity, dim=0)  # [730, B*n_gaussians]
+        # 转置并 reshape 为 [B, n_gaussians, 730] 以便后续 CRAM 拼接
+        kernel_weights = weights.t().reshape(bs, n_gaussians, -1)
+
         cov_all = (weights.t() @ self.gau_dict).reshape(bs, n_gaussians, 3)
-        tau_t = self._expand_tau(tau, bs, feat_ps.device)
-        if tau_t is not None:
-            tau_emb = self.tau_embed(tau_t.float())
-            cov_mod = self.cov_tau_mod(tau_emb)
-            cov_gamma = 1.0 + 0.1 * torch.tanh(cov_mod[:, :3]).unsqueeze(1)
-            cov_beta = 0.1 * torch.tanh(cov_mod[:, 3:]).unsqueeze(1)
-            cov_all = cov_all * cov_gamma + cov_beta
-
-        # Offset
-        offset_all = torch.tanh(self.mlp_offset(feat_flat)).reshape(bs, n_gaussians, 2)
-
+        # ==========================================
+        # 运动感知自适应偏移 (Motion-Aware Offset)
+        # ==========================================
+        # 计算基础偏移方向 [-1, 1]
+        offset_map = torch.tanh(self.conv_offset(param_feat))
+        base_offset_flat = offset_map.permute(0, 2, 3, 1).reshape(bs * n_gaussians, 2) # [B*n_gaussians, 2]
+        # 将其还原为空间维度以便与 w_map 对齐
+        base_offset = base_offset_flat.view(bs, ps_h, ps_w, 2).permute(0, 3, 1, 2) # [B, 2, ps_h, ps_w]
+        # 引入外层计算好的共享窗口 W_map
+        if hasattr(self, 'current_w_map') and self.current_w_map is not None:
+            w_map = self.current_w_map # [B, 1, H, W]
+            
+            # 如果 feat_ps 被下采样过（比如 PixelUnshuffle），需要对齐空间分辨率
+            if w_map.shape[-2:] != (ps_h, ps_w):
+                w_map_aligned = F.interpolate(w_map, size=(ps_h, ps_w), mode='nearest')
+            else:
+                w_map_aligned = w_map
+            
+            # 核心公式：Δ𝜇𝑡 = Δ𝜇𝑡 ⊙ 𝑊𝑚𝑎𝑝
+            final_offset = base_offset * w_map_aligned
+        else:
+            # 兼容没有 W_map 的情况（或老版本）
+            final_offset = base_offset
+        
+        offset_all = final_offset.permute(0, 2, 3, 1).reshape(bs, n_gaussians, 2)
         return {
             'color': color_all,
-            'cov': cov_all,
+            'kernel_weights': kernel_weights, # 新增：返回分布权重
+            'cov': cov_all, # 保留给老式渲染路径使用
             'offset': offset_all,
             'ps_h': ps_h,
             'ps_w': ps_w,
@@ -452,56 +574,53 @@ class GaussianFusion(nn.Module):
             dense_mode = self.motion_dense_mode
         motion_flow_01 = self._smooth_motion_flow(flow_01)
         motion_flow_10 = self._smooth_motion_flow(flow_10)
-
+        # step1: scale and shift fused image fusion according to tau embedding(distribution aligned)
         feat_ps_0, dense0 = self._make_gaussian_features(
             feat_fused_0, scale_h, scale_w, tau=rel_tau_0, dense_mode=dense_mode
         )
         feat_ps_N, denseN = self._make_gaussian_features(
             feat_fused_N, scale_h, scale_w, tau=rel_tau_N, dense_mode=dense_mode
         )
+        # step2: predict gaussian parameters for both endpoints. The parameters are conditioned on the relative tau to encourage distribution alignment and smoother motion interpolation.
         params0 = self._predict_gaussian_params(feat_ps_0, tau=rel_tau_0)
         paramsN = self._predict_gaussian_params(feat_ps_N, tau=rel_tau_N)
-
+        # ========================================================
+        # 2. CRAM: Covariance Resampling Alignment (核心对齐步骤)
+        # ========================================================
+        w_0 = params0['kernel_weights'] # [B, N, 730]
+        w_N = paramsN['kernel_weights'] # [B, N, 730]
+        # 扩展 tau_t 以拼接
+        tau_expand = tau_t.view(bs, 1, 1).expand(bs, params0['n_gaussians'], 1)
+        # Concat: 对应图中的 Concat 操作
+        cram_input = torch.cat([w_0, w_N, tau_expand], dim=-1) # [B, N, 1461]
+        # Projection: 对应图中的 Projection 网络
+        cram_logits = self.cram_projection(cram_input) # [B, N, 730]
+        # Softmax & Sample: 重新在先验库中采样得到 \Sigma_t
+        fused_weights = torch.softmax(cram_logits, dim=-1) # [B, N, 730]
+        cov_tau = fused_weights @ self.gau_dict # [B, N, 3]
+        # =======================================================
+        # 3. 计算物理运动坐标
         ps_h, ps_w = params0['ps_h'], params0['ps_w']
         xyz0 = self._base_xyz(params0['offset'], ps_h, ps_w, H, W)
         xyzN = self._base_xyz(paramsN['offset'], ps_h, ps_w, H, W)
         xyz0 = self._apply_flow_motion(xyz0, motion_flow_01, tau_t, ps_h, ps_w)
         xyzN = self._apply_flow_motion(xyzN, motion_flow_10, one_minus_tau, ps_h, ps_w)
-
+        # 4. 遮挡置信度与透明度
         conf_0, conf_N, cons_0, cons_N = self._compute_fb_confidence(flow_01, flow_10)
         conf0_grid = self._confidence_to_gaussian_grid(conf_0, ps_h, ps_w)
         confN_grid = self._confidence_to_gaussian_grid(conf_N, ps_h, ps_w)
         opacity0 = one_minus_tau.view(bs, 1, 1).expand(-1, params0['n_gaussians'], 1) * conf0_grid
         opacityN = tau_t.view(bs, 1, 1).expand(-1, paramsN['n_gaussians'], 1) * confN_grid
+        # =======================================================
+        # 5. 拼接准备渲染 (应用 CRAM 统一协方差)
+        # =======================================================
+        # 抛弃列表 append，直接使用统一的 cov_tau
+        color = torch.cat([params0['color'], paramsN['color']], dim=1)
 
-        colors = [params0['color'], paramsN['color']]
-        covs = [params0['cov'], paramsN['cov']]
-        xyzs = [xyz0, xyzN]
-        opacities = [opacity0, opacityN]
-        dense_tau = False
-
-        if feat_fused_tau is not None and self.tau_gaussian_opacity > 0:
-            feat_ps_tau, dense_tau = self._make_gaussian_features(
-                feat_fused_tau, scale_h, scale_w, tau=rel_tau_target, dense_mode=dense_mode
-            )
-            params_tau = self._predict_gaussian_params(feat_ps_tau, tau=rel_tau_target)
-            xyz_tau = self._base_xyz(params_tau['offset'], params_tau['ps_h'], params_tau['ps_w'], H, W)
-            midness = (1.0 - (2.0 * tau_t - 1.0).abs()).clamp(0.0, 1.0)
-            opacity_tau = (
-                self.tau_gaussian_opacity
-                * midness.view(bs, 1, 1)
-                * torch.ones(bs, params_tau['n_gaussians'], 1, device=device, dtype=params_tau['color'].dtype)
-            )
-            colors.append(params_tau['color'])
-            covs.append(params_tau['cov'])
-            xyzs.append(xyz_tau)
-            opacities.append(opacity_tau)
-
-        color = torch.cat(colors, dim=1)
-        cov = torch.cat(covs, dim=1)
-        xyz = torch.cat(xyzs, dim=1)
-        opacity = torch.cat(opacities, dim=1).to(color.dtype)
-
+        # 关键：两拨物理位置不同的高斯点，严格共享同一个时间维度的形状
+        cov = torch.cat([cov_tau, cov_tau], dim=1)
+        xyz = torch.cat([xyz0, xyzN], dim=1)
+        opacity = torch.cat([opacity0, opacityN], dim=1).to(color.dtype)
         with torch.no_grad():
             flow01_grid = self._flow_to_gaussian_grid(flow_01, ps_h, ps_w)
             flow10_grid = self._flow_to_gaussian_grid(flow_10, ps_h, ps_w)
@@ -514,14 +633,60 @@ class GaussianFusion(nn.Module):
             self._temporal_stats['fb_conf1_mean'] = conf_N.mean().item()
             self._temporal_stats['fb_cons0_mean'] = cons_0.mean().item()
             self._temporal_stats['fb_cons1_mean'] = cons_N.mean().item()
-            self._temporal_stats['tau_gaussian_opacity_mean'] = (
-                opacities[2].mean().item() if len(opacities) > 2 else 0.0
-            )
+            # 移除了对 tau_gaussian_opacity 的统计，保持 log 清爽
 
         return self._render_gaussian_params(
             color, cov, xyz, opacity,
-            scale_h, scale_w, H, W, dense0 or denseN or dense_tau, debug_tag='motion'
+            scale_h, scale_w, H, W, dense0 or denseN, debug_tag='motion'
         )
+        # colors = [params0['color'], paramsN['color']]
+        # covs = [params0['cov'], paramsN['cov']]
+        # xyzs = [xyz0, xyzN]
+        # opacities = [opacity0, opacityN]
+        # dense_tau = False
+
+        # if feat_fused_tau is not None and self.tau_gaussian_opacity > 0:
+        #     feat_ps_tau, dense_tau = self._make_gaussian_features(
+        #         feat_fused_tau, scale_h, scale_w, tau=rel_tau_target, dense_mode=dense_mode
+        #     )
+        #     params_tau = self._predict_gaussian_params(feat_ps_tau, tau=rel_tau_target)
+        #     xyz_tau = self._base_xyz(params_tau['offset'], params_tau['ps_h'], params_tau['ps_w'], H, W)
+        #     midness = (1.0 - (2.0 * tau_t - 1.0).abs()).clamp(0.0, 1.0)
+        #     opacity_tau = (
+        #         self.tau_gaussian_opacity
+        #         * midness.view(bs, 1, 1)
+        #         * torch.ones(bs, params_tau['n_gaussians'], 1, device=device, dtype=params_tau['color'].dtype)
+        #     )
+        #     colors.append(params_tau['color'])
+        #     covs.append(params_tau['cov'])
+        #     xyzs.append(xyz_tau)
+        #     opacities.append(opacity_tau)
+
+        # color = torch.cat(colors, dim=1)
+        # cov = torch.cat(covs, dim=1)
+        # xyz = torch.cat(xyzs, dim=1)
+        # opacity = torch.cat(opacities, dim=1).to(color.dtype)
+
+        # with torch.no_grad():
+        #     flow01_grid = self._flow_to_gaussian_grid(flow_01, ps_h, ps_w)
+        #     flow10_grid = self._flow_to_gaussian_grid(flow_10, ps_h, ps_w)
+        #     self._temporal_stats['motion_flow01_abs_mean'] = flow01_grid.abs().mean().item()
+        #     self._temporal_stats['motion_flow10_abs_mean'] = flow10_grid.abs().mean().item()
+        #     self._temporal_stats['motion_tau_mean'] = tau_t.mean().item()
+        #     self._temporal_stats['motion_rel_tau0_mean'] = rel_tau_0.mean().item()
+        #     self._temporal_stats['motion_rel_tauN_mean'] = rel_tau_N.mean().item()
+        #     self._temporal_stats['fb_conf0_mean'] = conf_0.mean().item()
+        #     self._temporal_stats['fb_conf1_mean'] = conf_N.mean().item()
+        #     self._temporal_stats['fb_cons0_mean'] = cons_0.mean().item()
+        #     self._temporal_stats['fb_cons1_mean'] = cons_N.mean().item()
+        #     self._temporal_stats['tau_gaussian_opacity_mean'] = (
+        #         opacities[2].mean().item() if len(opacities) > 2 else 0.0
+        #     )
+
+        # return self._render_gaussian_params(
+        #     color, cov, xyz, opacity,
+        #     scale_h, scale_w, H, W, dense0 or denseN or dense_tau, debug_tag='motion'
+        # )
 
     def forward(self, vis_0, ir_0, vis_N, ir_N, scale, tau):
         """
@@ -565,7 +730,15 @@ class GaussianFusion(nn.Module):
         # --- Step 2: Encode both modalities at both time steps ---
         feat_vis_0, feat_ir_0 = self.encode(vis_0, ir_0)
         feat_vis_N, feat_ir_N = self.encode(vis_N, ir_N)
-
+        # =======================================================
+        # NEW 运动感知自适应窗口预测 (Motion-Aware Adaptive Window)
+        # =======================================================
+        # 利用 SIREN 网络和可见光端点特征，一次性计算出全局共享的 W_map
+        if hasattr(self, 'window_scorer'):
+            v_map = self.window_scorer(feat_vis_0, feat_vis_N) # [B, 10, H, W]
+            # 加权求和得到具体的像素级最大偏移范围
+            w_map = torch.sum(v_map * self.window_bank, dim=1, keepdim=True) # [B, 1, H, W]
+            self.current_w_map = w_map # 存入实例，供 _predict_gaussian_params 缩放 offset 使用
         # --- Step 3: Adapt flow to feature resolution ---
         # Features are same resolution as input (encoder preserves spatial dims)
         # If feature resolution differs from flow resolution, resize flow
@@ -573,9 +746,11 @@ class GaussianFusion(nn.Module):
             fh, fw = feat_vis_0.shape[2], feat_vis_0.shape[3]
             scale_x = fw / flow_01.shape[3]
             scale_y = fh / flow_01.shape[2]
+
             flow_01 = F.interpolate(flow_01, size=(fh, fw), mode='bilinear', align_corners=True)
             flow_01[:, 0] *= scale_x
             flow_01[:, 1] *= scale_y
+
             flow_10 = F.interpolate(flow_10, size=(fh, fw), mode='bilinear', align_corners=True)
             flow_10[:, 0] *= scale_x
             flow_10[:, 1] *= scale_y
@@ -620,11 +795,11 @@ class GaussianFusion(nn.Module):
             # Fuse each endpoint first, then move endpoint Gaussians along flow.
             feat_fused_0 = self.fusion(feat_vis_0, feat_ir_0)
             feat_fused_N = self.fusion(feat_vis_N, feat_ir_N)
-            feat_fused_tau = self.fusion(feat_vis_tau, feat_ir_tau)
+            # feat_fused_tau = self.fusion(feat_vis_tau, feat_ir_tau)
             output = self._render_motion_gaussians(
                 feat_fused_0, feat_fused_N, flow_01, flow_10,
                 scale_h, scale_w, lr_h, lr_w, tau=tau,
-                feat_fused_tau=feat_fused_tau
+                feat_fused_tau=None
             )
         else:
             # Backward-compatible path: interpolate features, fuse, then render.
