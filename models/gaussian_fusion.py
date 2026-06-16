@@ -224,11 +224,6 @@ class GaussianFusion(nn.Module):
             nn.GELU(),
             nn.Linear(256, 256 * 2),  # γ and β for FiLM on 256-ch features
         )
-        self.cov_tau_mod = nn.Sequential(
-            nn.Linear(64, 64),
-            nn.GELU(),
-            nn.Linear(64, 6),  # γ and β for [L11, L21, L22]
-        )
 
         # Pre-defined Gaussian covariance dictionary (730 templates)
         cho1 = torch.tensor([0, 0.41, 0.62, 0.98, 1.13, 1.29, 1.64, 1.85, 2.36])
@@ -443,7 +438,7 @@ class GaussianFusion(nn.Module):
         disp_y = 2 * tau_weight * flow_flat[:, :, 1:2] / flow_h
         return xyz + torch.cat((disp_x, disp_y), dim=2)
 
-    @torch.cuda.amp.custom_fwd(cast_inputs=torch.float32)
+    @torch.amp.custom_fwd(cast_inputs=torch.float32, device_type='cuda')
     def _render_gaussian_params(self, color_all, cov_all, xyz_all, opacity_all,
                                 scale_h, scale_w, H, W, dense_sr_render,
                                 debug_tag='gaussian'):
@@ -529,7 +524,7 @@ class GaussianFusion(nn.Module):
 
         return torch.cat(pred, dim=0)  # [B, 3, H, W]
 
-    @torch.cuda.amp.custom_fwd(cast_inputs=torch.float32)
+    @torch.amp.custom_fwd(cast_inputs=torch.float32, device_type='cuda')
     def _render_gaussians(self, feat, scale_h, scale_w, lr_h, lr_w, tau=None):
         """
         Original feature-blending Gaussian rendering path with optional τ FiLM.
@@ -548,7 +543,7 @@ class GaussianFusion(nn.Module):
             scale_h, scale_w, H, W, dense_sr_render, debug_tag='blend'
         )
 
-    @torch.cuda.amp.custom_fwd(cast_inputs=torch.float32)
+    @torch.amp.custom_fwd(cast_inputs=torch.float32, device_type='cuda')
     def _render_motion_gaussians(self, feat_fused_0, feat_fused_N, flow_01, flow_10,
                                  scale_h, scale_w, lr_h, lr_w, tau,
                                  feat_fused_tau=None):
