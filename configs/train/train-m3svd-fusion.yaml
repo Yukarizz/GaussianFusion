@@ -28,6 +28,7 @@ model:
     motion_force_dense: false
     motion_dense_mode: none
     motion_flow_smooth_kernel: 3
+    motion_pair_merge: true
     tau_gaussian_opacity: 0.0
 
 # Training dataset
