@@ -124,6 +124,7 @@ class GaussianFusion(nn.Module):
                  fb_confidence_floor=0.2,
                  motion_force_dense=False,
                  motion_dense_mode='none', motion_flow_smooth_kernel=3,
+                 motion_pair_merge=True,
                  tau_gaussian_opacity=0.5):
         super().__init__()
 
@@ -135,6 +136,7 @@ class GaussianFusion(nn.Module):
         self.motion_force_dense = motion_force_dense
         self.motion_dense_mode = motion_dense_mode
         self.motion_flow_smooth_kernel = motion_flow_smooth_kernel
+        self.motion_pair_merge = motion_pair_merge
         self.tau_gaussian_opacity = tau_gaussian_opacity
         self.BLOCK_H, self.BLOCK_W = 16, 16
 
@@ -607,15 +609,30 @@ class GaussianFusion(nn.Module):
         opacity0 = one_minus_tau.view(bs, 1, 1).expand(-1, params0['n_gaussians'], 1) * conf0_grid
         opacityN = tau_t.view(bs, 1, 1).expand(-1, paramsN['n_gaussians'], 1) * confN_grid
         # =======================================================
-        # 5. 拼接准备渲染 (应用 CRAM 统一协方差)
+        # 5. 准备渲染 (应用 CRAM 统一协方差)
         # =======================================================
-        # 抛弃列表 append，直接使用统一的 cov_tau
-        color = torch.cat([params0['color'], paramsN['color']], dim=1)
-
-        # 关键：两拨物理位置不同的高斯点，严格共享同一个时间维度的形状
-        cov = torch.cat([cov_tau, cov_tau], dim=1)
-        xyz = torch.cat([xyz0, xyzN], dim=1)
-        opacity = torch.cat([opacity0, opacityN], dim=1).to(color.dtype)
+        if self.motion_pair_merge:
+            # Pair-wise merge prevents the two endpoint clouds from being
+            # rasterized as a temporal cross-dissolve when flow is imperfect.
+            # Position uses confidence-only weights because both endpoints
+            # have already been moved to target time tau. Color/opacity keep
+            # the temporal contribution weights.
+            pos_den = (conf0_grid + confN_grid).clamp_min(1e-6)
+            pos_w0 = conf0_grid / pos_den
+            pos_wN = confN_grid / pos_den
+            pair_den = (opacity0 + opacityN).clamp_min(1e-6)
+            pair_w0 = opacity0 / pair_den
+            pair_wN = opacityN / pair_den
+            color = pair_w0 * params0['color'] + pair_wN * paramsN['color']
+            xyz = pos_w0 * xyz0 + pos_wN * xyzN
+            cov = cov_tau
+            opacity = pair_den.clamp(max=1.0).to(color.dtype)
+        else:
+            color = torch.cat([params0['color'], paramsN['color']], dim=1)
+            # 关键：两拨物理位置不同的高斯点，严格共享同一个时间维度的形状
+            cov = torch.cat([cov_tau, cov_tau], dim=1)
+            xyz = torch.cat([xyz0, xyzN], dim=1)
+            opacity = torch.cat([opacity0, opacityN], dim=1).to(color.dtype)
         with torch.no_grad():
             flow01_grid = self._flow_to_gaussian_grid(flow_01, ps_h, ps_w)
             flow10_grid = self._flow_to_gaussian_grid(flow_10, ps_h, ps_w)
@@ -628,6 +645,8 @@ class GaussianFusion(nn.Module):
             self._temporal_stats['fb_conf1_mean'] = conf_N.mean().item()
             self._temporal_stats['fb_cons0_mean'] = cons_0.mean().item()
             self._temporal_stats['fb_cons1_mean'] = cons_N.mean().item()
+            self._temporal_stats['motion_pair_merge'] = float(self.motion_pair_merge)
+            self._temporal_stats['motion_pair_distance_mean'] = torch.norm(xyz0 - xyzN, dim=-1).mean().item()
             # 移除了对 tau_gaussian_opacity 的统计，保持 log 清爽
 
         return self._render_gaussian_params(
