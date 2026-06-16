@@ -283,7 +283,7 @@ def run_random_pair_tau_sweep(args, model, device):
     to_tensor = transforms.ToTensor()
     scale_h, scale_w = parse_scale(args.scale)
     interval = max(1, args.anchor_interval)
-    tau_values = [i / 10.0 for i in range(1, 10)]
+    tau_values = [i / 8.0 for i in range(1, 8)]
     videos = select_videos(args.data_root, args.videos, args.max_videos)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
