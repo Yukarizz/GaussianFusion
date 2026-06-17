@@ -25,3 +25,4 @@ python train.py \
     --save_dir ./save/gaussian_fusion \
     --wandb_project GaussianFusion \
     --wandb_run "exp01-1gpu" \
+    --batch_size 64

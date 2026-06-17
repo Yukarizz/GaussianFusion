@@ -462,6 +462,7 @@ def main():
                         help='wandb project name')
     parser.add_argument('--wandb_run', type=str, default=None, help='wandb run name')
     parser.add_argument('--wandb_offline', action='store_true', help='Run wandb offline')
+    parser.add_argument('--batch_size', type=int, default=None,help='override batch size')
     args = parser.parse_args()
 
     # Distributed setup (auto-detected via torchrun env vars)
@@ -476,6 +477,8 @@ def main():
     with open(args.config, 'r') as f:
         config = yaml.safe_load(f)
 
+    if args.batch_size is not None:
+        config['batch_size'] = args.batch_size
     # Create save directory (only rank 0)
     if is_main_process():
         os.makedirs(args.save_dir, exist_ok=True)
