@@ -547,111 +547,98 @@ class GaussianFusion(nn.Module):
 
     @torch.amp.custom_fwd(cast_inputs=torch.float32, device_type='cuda')
     def _render_motion_gaussians(self, feat_fused_0, feat_fused_N, flow_01, flow_10,
-                                 scale_h, scale_w, lr_h, lr_w, tau,
-                                 feat_fused_tau=None):
+                                scale_h, scale_w, lr_h, lr_w, tau,
+                                feat_fused_tau=None):
         """
         Motion-aware Gaussian rendering.
 
-        Each endpoint predicts its own Gaussian primitives. Their centers are
-        explicitly displaced by optical flow to time τ before both primitive
-        sets are splatted onto the target canvas.
+        Use fused intermediate tau feature to predict one set of Gaussian parameters.
+        Endpoint features are only used to estimate motion-aligned Gaussian centers.
         """
         bs = feat_fused_0.shape[0]
         device = feat_fused_0.device
         H = round(lr_h * scale_h)
         W = round(lr_w * scale_w)
+
         tau_t = self._expand_tau(tau, bs, device)
         one_minus_tau = 1.0 - tau_t
-        rel_tau_0 = tau_t
-        rel_tau_N = tau_t - 1.0
         rel_tau_target = torch.zeros_like(tau_t)
+
+        if feat_fused_tau is None:
+            feat_fused_tau = 0.5 * (feat_fused_0 + feat_fused_N)
+
         if self.motion_force_dense or max(scale_h, scale_w) > 1.0:
             dense_mode = 'full'
         else:
             dense_mode = self.motion_dense_mode
+
         motion_flow_01 = self._smooth_motion_flow(flow_01)
         motion_flow_10 = self._smooth_motion_flow(flow_10)
-        # step1: scale and shift fused image fusion according to tau embedding(distribution aligned)
-        feat_ps_0, dense0 = self._make_gaussian_features(
-            feat_fused_0, scale_h, scale_w, tau=rel_tau_0, dense_mode=dense_mode
+
+        # 1. 只用中间 tau 特征预测一套 Gaussian 参数
+        feat_ps_tau, dense_tau = self._make_gaussian_features(
+            feat_fused_tau, scale_h, scale_w,
+            tau=rel_tau_target,
+            dense_mode=dense_mode
         )
-        feat_ps_N, denseN = self._make_gaussian_features(
-            feat_fused_N, scale_h, scale_w, tau=rel_tau_N, dense_mode=dense_mode
+        params_tau = self._predict_gaussian_params(
+            feat_ps_tau,
+            tau=rel_tau_target
         )
-        # step2: predict gaussian parameters for both endpoints. The parameters are conditioned on the relative tau to encourage distribution alignment and smoother motion interpolation.
-        params0 = self._predict_gaussian_params(feat_ps_0, tau=rel_tau_0)
-        paramsN = self._predict_gaussian_params(feat_ps_N, tau=rel_tau_N)
-        # ========================================================
-        # 2. CRAM: Covariance Resampling Alignment (核心对齐步骤)
-        # ========================================================
-        w_0 = params0['kernel_weights'] # [B, N, 730]
-        w_N = paramsN['kernel_weights'] # [B, N, 730]
-        # 扩展 tau_t 以拼接
-        tau_expand = tau_t.view(bs, 1, 1).expand(bs, params0['n_gaussians'], 1)
-        # Concat: 对应图中的 Concat 操作
-        cram_input = torch.cat([w_0, w_N, tau_expand], dim=-1) # [B, N, 1461]
-        # Projection: 对应图中的 Projection 网络
-        cram_logits = self.cram_projection(cram_input) # [B, N, 730]
-        # Softmax & Sample: 重新在先验库中采样得到 \Sigma_t
-        fused_weights = torch.softmax(cram_logits, dim=-1) # [B, N, 730]
-        cov_tau = fused_weights @ self.gau_dict # [B, N, 3]
-        # =======================================================
-        # 3. 计算物理运动坐标
-        ps_h, ps_w = params0['ps_h'], params0['ps_w']
-        xyz0 = self._base_xyz(params0['offset'], ps_h, ps_w, H, W)
-        xyzN = self._base_xyz(paramsN['offset'], ps_h, ps_w, H, W)
-        xyz0 = self._apply_flow_motion(xyz0, motion_flow_01, tau_t, ps_h, ps_w)
-        xyzN = self._apply_flow_motion(xyzN, motion_flow_10, one_minus_tau, ps_h, ps_w)
-        # 4. 遮挡置信度与透明度
+
+        ps_h, ps_w = params_tau['ps_h'], params_tau['ps_w']
+
+        # 2. 先得到 tau Gaussian 的基础坐标
+        xyz_base = self._base_xyz(
+            params_tau['offset'], ps_h, ps_w, H, W
+        )
+
+        # 3. 用双向 flow 生成两个 motion-aligned 坐标候选
+        xyz_from_0 = self._apply_flow_motion(
+            xyz_base, motion_flow_01, tau_t, ps_h, ps_w
+        )
+        xyz_from_N = self._apply_flow_motion(
+            xyz_base, motion_flow_10, one_minus_tau, ps_h, ps_w
+        )
+
+        # 4. 前后向一致性置信度
         conf_0, conf_N, cons_0, cons_N = self._compute_fb_confidence(flow_01, flow_10)
         conf0_grid = self._confidence_to_gaussian_grid(conf_0, ps_h, ps_w)
         confN_grid = self._confidence_to_gaussian_grid(conf_N, ps_h, ps_w)
-        opacity0 = one_minus_tau.view(bs, 1, 1).expand(-1, params0['n_gaussians'], 1) * conf0_grid
-        opacityN = tau_t.view(bs, 1, 1).expand(-1, paramsN['n_gaussians'], 1) * confN_grid
-        # =======================================================
-        # 5. 准备渲染 (应用 CRAM 统一协方差)
-        # =======================================================
-        if self.motion_pair_merge:
-            # Pair-wise merge prevents the two endpoint clouds from being
-            # rasterized as a temporal cross-dissolve when flow is imperfect.
-            # Position uses confidence-only weights because both endpoints
-            # have already been moved to target time tau. Color/opacity keep
-            # the temporal contribution weights.
-            pos_den = (conf0_grid + confN_grid).clamp_min(1e-6)
-            pos_w0 = conf0_grid / pos_den
-            pos_wN = confN_grid / pos_den
-            pair_den = (opacity0 + opacityN).clamp_min(1e-6)
-            pair_w0 = opacity0 / pair_den
-            pair_wN = opacityN / pair_den
-            color = pair_w0 * params0['color'] + pair_wN * paramsN['color']
-            xyz = pos_w0 * xyz0 + pos_wN * xyzN
-            cov = cov_tau
-            opacity = pair_den.clamp(max=1.0).to(color.dtype)
-        else:
-            color = torch.cat([params0['color'], paramsN['color']], dim=1)
-            # 关键：两拨物理位置不同的高斯点，严格共享同一个时间维度的形状
-            cov = torch.cat([cov_tau, cov_tau], dim=1)
-            xyz = torch.cat([xyz0, xyzN], dim=1)
-            opacity = torch.cat([opacity0, opacityN], dim=1).to(color.dtype)
+
+        # 5. 根据置信度融合位置
+        pos_den = (conf0_grid + confN_grid).clamp_min(1e-6)
+        pos_w0 = conf0_grid / pos_den
+        pos_wN = confN_grid / pos_den
+
+        xyz = pos_w0 * xyz_from_0 + pos_wN * xyz_from_N
+
+        # 6. color / cov / offset 全部来自 tau 特征预测的一套参数
+        color = params_tau['color']
+        cov = params_tau['cov']
+
+        # 7. opacity 也只保留一套
+        opacity = pos_den.clamp(max=1.0).to(color.dtype)
+
         with torch.no_grad():
             flow01_grid = self._flow_to_gaussian_grid(flow_01, ps_h, ps_w)
             flow10_grid = self._flow_to_gaussian_grid(flow_10, ps_h, ps_w)
+
             self._temporal_stats['motion_flow01_abs_mean'] = flow01_grid.abs().mean().item()
             self._temporal_stats['motion_flow10_abs_mean'] = flow10_grid.abs().mean().item()
             self._temporal_stats['motion_tau_mean'] = tau_t.mean().item()
-            self._temporal_stats['motion_rel_tau0_mean'] = rel_tau_0.mean().item()
-            self._temporal_stats['motion_rel_tauN_mean'] = rel_tau_N.mean().item()
             self._temporal_stats['fb_conf0_mean'] = conf_0.mean().item()
             self._temporal_stats['fb_conf1_mean'] = conf_N.mean().item()
             self._temporal_stats['fb_cons0_mean'] = cons_0.mean().item()
             self._temporal_stats['fb_cons1_mean'] = cons_N.mean().item()
-            self._temporal_stats['motion_pair_merge'] = float(self.motion_pair_merge)
-            self._temporal_stats['motion_pair_distance_mean'] = torch.norm(xyz0 - xyzN, dim=-1).mean().item()
-            # 移除了对 tau_gaussian_opacity 的统计，保持 log 清爽
+            self._temporal_stats['motion_pair_merge'] = 1.0
+            self._temporal_stats['motion_pair_distance_mean'] = torch.norm(
+                xyz_from_0 - xyz_from_N, dim=-1
+            ).mean().item()
 
         return self._render_gaussian_params(
             color, cov, xyz, opacity,
-            scale_h, scale_w, H, W, dense0 or denseN, debug_tag='motion'
+            scale_h, scale_w, H, W, dense_tau, debug_tag='motion'
         )
         # colors = [params0['color'], paramsN['color']]
         # covs = [params0['cov'], paramsN['cov']]
@@ -809,11 +796,11 @@ class GaussianFusion(nn.Module):
             # Fuse each endpoint first, then move endpoint Gaussians along flow.
             feat_fused_0 = self.fusion(feat_vis_0, feat_ir_0)
             feat_fused_N = self.fusion(feat_vis_N, feat_ir_N)
-            # feat_fused_tau = self.fusion(feat_vis_tau, feat_ir_tau)
+            feat_fused_tau = self.fusion(feat_vis_tau, feat_ir_tau)
             output = self._render_motion_gaussians(
                 feat_fused_0, feat_fused_N, flow_01, flow_10,
                 scale_h, scale_w, lr_h, lr_w, tau=tau,
-                feat_fused_tau=None
+                feat_fused_tau=feat_fused_tau
             )
         else:
             # Backward-compatible path: interpolate features, fuse, then render.
