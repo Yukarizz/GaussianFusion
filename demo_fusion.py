@@ -87,6 +87,24 @@ def load_model(model_path, config_path, device):
         print(f'Warning: missing checkpoint keys initialized randomly: {incompatible.missing_keys}')
     if incompatible.unexpected_keys:
         print(f'Warning: ignored unexpected checkpoint keys: {incompatible.unexpected_keys}')
+
+    # Enable full-res color prediction only when its weights were actually
+    # trained (present in the checkpoint). Prevents random-init head artifacts.
+    has_full = any(k.startswith('conv_color_full.') for k in state.keys())
+    if getattr(model, 'full_res_color', False) and has_full:
+        model.full_res_color_trained = True
+        print('[demo] full_res_color enabled (trained conv_color_full found)')
+    else:
+        model.full_res_color_trained = False
+
+    # flow_driven_xyz should stay False: the paper explicitly forbids adding
+    # flow to Gaussian centers (double motion compensation). Flow is only used
+    # to build F_tau; offset handles the remaining displacement.
+    if getattr(model, 'flow_driven_xyz', False):
+        print('[demo] WARNING: flow_driven_xyz=True contradicts paper design and '
+              'causes moving-object artifacts; consider setting it to false.')
+    print(f'[demo] flow_driven_xyz={getattr(model, "flow_driven_xyz", False)}')
+
     model.eval()
     return model
 

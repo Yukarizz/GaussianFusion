@@ -1,0 +1,56 @@
+# Debug config: tiny dataset, 1 epoch, to validate the full train.py main loop.
+seed: 42
+
+model:
+  name: gaussian-fusion
+  args:
+    encoder_spec:
+      name: edsr-baseline
+      args:
+        n_resblocks: 8
+        n_feats: 48
+        res_scale: 1
+        scale: [1]
+        no_upsampling: true
+        n_colors: 48
+        rgb_range: 1
+        pretrained_path: null
+    spynet_pretrained: sintel-final
+    n_feats: 48
+    freeze_spynet: true
+    occ_threshold: 5.0
+    gaussian_render_mode: motion
+    motion_force_dense: false
+    motion_dense_mode: none
+    full_res_color: false
+
+train_dataset:
+  name: m3svd-temporal-fusion
+  args:
+    root_path: ./data/M3SVD
+    split: train_dbg
+    vis_modality: visible_Enhance
+    ir_modality: infrared_Enhance
+    n_min: 2
+    n_max: 4
+    scale_min: 1.0
+    scale_max: 1.0
+    patch_size: 64
+    augment: true
+
+batch_size: 2
+num_workers: 2
+epochs: 1
+warmup_epochs: 1
+lr: 1.0e-4
+weight_decay: 0
+use_amp: true
+save_every: 1
+val_every: 1
+lambda_int: 1.0
+lambda_color: 1.0
+lambda_grad: 2.0
+lambda_temporal: 0.0
+lambda_aux_vis: 0.0
+lambda_aux_ir: 0.0
+lambda_aow: 0.01

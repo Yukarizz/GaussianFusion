@@ -98,7 +98,7 @@ class FusionLoss(nn.Module):
 
     def __init__(self, lambda_int=1.0, lambda_color=1.0, lambda_grad=5.0,
                  lambda_temporal=0.0, lambda_aux_vis=0.0, lambda_aux_ir=0.0,
-                 channels=3):
+                 lambda_aow=0.0, channels=3):
         super().__init__()
         self.lambda_int = lambda_int
         self.lambda_color = lambda_color  # 色彩损失权重
@@ -106,11 +106,22 @@ class FusionLoss(nn.Module):
         self.lambda_temporal = lambda_temporal
         self.lambda_aux_vis = lambda_aux_vis
         self.lambda_aux_ir = lambda_aux_ir
+        self.lambda_aow = lambda_aow      # AOW 窗口正则（抑制 SIREN 坍缩到最大窗口）
         
         self.l1 = nn.L1Loss()
         self.grad_operator = GradientLoss(channels=channels)
 
-    def forward(self, fused, vis_gt, ir_gt, temporal_loss=None, aux_outputs=None):
+    def _weighted_l1(self, pred, target, weight):
+        """Weighted L1: |pred - target| * weight, averaged over spatial dims.
+
+        weight: [B, 1, H, W] in [0, 1], emphasizing moving regions.
+        """
+        diff = (pred - target).abs()                       # [B, C, H, W]
+        w = weight.expand_as(diff)                         # broadcast
+        return (diff * w).sum() / (w.sum() + 1e-8)
+
+    def forward(self, fused, vis_gt, ir_gt, temporal_loss=None, aux_outputs=None,
+                aow_loss=None):
         """
         Args:
             fused: Model output [B, 3, H, W] (RGB).
@@ -168,19 +179,32 @@ class FusionLoss(nn.Module):
         if aux_outputs:
             aux_vis = aux_outputs.get('vis_tau')
             aux_ir = aux_outputs.get('ir_tau')
+            mw = aux_outputs.get('motion_weight')
             if aux_vis is not None:
                 vis_aux_gt = vis_gt
                 if aux_vis.shape[-2:] != vis_gt.shape[-2:]:
                     vis_aux_gt = F.interpolate(vis_gt, size=aux_vis.shape[-2:], mode='bilinear', align_corners=False)
-                loss_aux_vis = self.l1(aux_vis, vis_aux_gt)
+                if mw is not None and mw.shape[-2:] == aux_vis.shape[-2:]:
+                    # Motion-weighted L1: emphasize moving regions.
+                    loss_aux_vis = self._weighted_l1(aux_vis, vis_aux_gt, mw)
+                else:
+                    loss_aux_vis = self.l1(aux_vis, vis_aux_gt)
             if aux_ir is not None:
                 ir_aux_gt = ir_gt
                 if aux_ir.shape[-2:] != ir_gt.shape[-2:]:
                     ir_aux_gt = F.interpolate(ir_gt, size=aux_ir.shape[-2:], mode='bilinear', align_corners=False)
-                loss_aux_ir = self.l1(aux_ir, ir_aux_gt)
+                if mw is not None and mw.shape[-2:] == aux_ir.shape[-2:]:
+                    loss_aux_ir = self._weighted_l1(aux_ir, ir_aux_gt, mw)
+                else:
+                    loss_aux_ir = self.l1(aux_ir, ir_aux_gt)
 
         total = total + self.lambda_aux_vis * loss_aux_vis + self.lambda_aux_ir * loss_aux_ir
-        
+
+        loss_aow = fused.new_tensor(0.0)
+        if aow_loss is not None:
+            loss_aow = aow_loss
+        total = total + self.lambda_aow * loss_aow
+
         return total, {
             'loss_int': loss_int.item(),
             'loss_color': loss_color.item(),
@@ -188,6 +212,7 @@ class FusionLoss(nn.Module):
             'loss_temporal': temporal_loss.detach().item(),
             'loss_aux_vis': loss_aux_vis.detach().item(),
             'loss_aux_ir': loss_aux_ir.detach().item(),
+            'loss_aow': loss_aow.detach().item(),
             'loss_total': total.item(),
         }
 
@@ -244,6 +269,62 @@ def collapse_diagnostics(fused, vis_0, ir_0, vis_N, ir_N, vis_gt, ir_gt, tau):
     }
 
 
+@torch.no_grad()
+def flow_heatmap(flow):
+    """Convert optical flow [B,2,H,W] to an RGB heatmap [B,3,H,W] in [0,1].
+
+    Hue encodes direction (angle), brightness encodes speed (magnitude),
+    normalized across the batch for consistent contrast.
+    """
+    B, _, H, W = flow.shape
+    mag = flow.norm(dim=1, keepdim=True)                       # [B,1,H,W]
+    if mag.max() < 1e-6:
+        return torch.zeros(B, 3, H, W, device=flow.device)
+    norm = mag / (mag.max() + 1e-6)                            # [B,1,H,W] in [0,1]
+
+    ang = torch.atan2(flow[:, 1:2], flow[:, 0:1])              # [B,1,H,W] in [-pi,pi]
+    hue = (ang + math.pi) / (2 * math.pi)                      # [0,1]
+    # HSV -> RGB: saturation=0.9, value=0.4 + 0.6*norm (slow=dark, fast=bright)
+    h = hue * 6.0
+    i = h.floor().long()
+    f = h - i.float()
+    s = torch.full_like(hue, 0.9)
+    v = 0.4 + 0.6 * norm
+    p = v * (1 - s)
+    q = v * (1 - s * f)
+    t = v * (1 - s * (1 - f))
+    i_mod = i % 6
+    r = torch.where(i_mod == 0, v, torch.where(i_mod == 1, q, torch.where(i_mod == 2, p,
+        torch.where(i_mod == 3, p, torch.where(i_mod == 4, t, v)))))
+    g = torch.where(i_mod == 0, t, torch.where(i_mod == 1, v, torch.where(i_mod == 2, v,
+        torch.where(i_mod == 3, q, torch.where(i_mod == 4, p, p)))))
+    b = torch.where(i_mod == 0, p, torch.where(i_mod == 1, p, torch.where(i_mod == 2, t,
+        torch.where(i_mod == 3, v, torch.where(i_mod == 4, v, q)))))
+    return torch.cat([r, g, b], dim=1).clamp(0, 1)
+
+
+@torch.no_grad()
+def motion_overlay(img, flow, top_frac=0.05, color=(1.0, 0.1, 0.1)):
+    """Overlay a red mask on the top-`top_frac` fastest-moving pixels.
+
+    Args:
+        img: Image tensor [B,3,H,W] in [0,1].
+        flow: Optical flow [B,2,H,W].
+        top_frac: Fraction of pixels considered "fastest" (0-1).
+        color: RGB tint for the overlay.
+    Returns:
+        [B,3,H,W] in [0,1] with the motion region highlighted in `color`.
+    """
+    B, _, H, W = img.shape
+    mag = flow.norm(dim=1, keepdim=True)                       # [B,1,H,W]
+    overlay = img.clone()
+    thr = mag.flatten(1).quantile(1.0 - top_frac, dim=1).view(B, 1, 1, 1)  # per-sample threshold
+    mask = (mag > thr) & (mag > 1e-3)
+    tint = torch.tensor(color, device=img.device).view(1, 3, 1, 1)
+    overlay = torch.where(mask, 0.5 * overlay + 0.5 * tint, overlay)
+    return overlay
+
+
 def make_data_loader(config, tag='train'):
     """Create data loader from config."""
     dataset = datasets.make(config[f'{tag}_dataset'])
@@ -286,6 +367,7 @@ def train_epoch(model, loader, optimizer, criterion, device, epoch, global_step,
         'loss_temporal': Averager(),
         'loss_aux_vis': Averager(),
         'loss_aux_ir': Averager(),
+        'loss_aow': Averager(),
     }
 
     use_amp = scaler is not None
@@ -307,9 +389,11 @@ def train_epoch(model, loader, optimizer, criterion, device, epoch, global_step,
             fused = model(vis_0, ir_0, vis_N, ir_N, scale=scale, tau=tau)
             temporal_loss = raw_model.get_temporal_regularization() if hasattr(raw_model, 'get_temporal_regularization') else None
             aux_outputs = raw_model.get_aux_outputs() if hasattr(raw_model, 'get_aux_outputs') else None
+            aow_loss = raw_model.get_aow_regularization() if hasattr(raw_model, 'get_aow_regularization') else None
             loss, loss_dict = criterion(fused, vis_gt, ir_gt,
                                        temporal_loss=temporal_loss,
-                                       aux_outputs=aux_outputs)
+                                       aux_outputs=aux_outputs,
+                                       aow_loss=aow_loss)
 
         # Skip step if loss is NaN/Inf or spikes too far above EMA
         cur_loss = loss.item()
@@ -349,6 +433,7 @@ def train_epoch(model, loader, optimizer, criterion, device, epoch, global_step,
                 'train/loss_temporal': loss_dict['loss_temporal'],
                 'train/loss_aux_vis': loss_dict['loss_aux_vis'],
                 'train/loss_aux_ir': loss_dict['loss_aux_ir'],
+                'train/loss_aow': loss_dict['loss_aow'],
                 'train/lr': optimizer.param_groups[0]['lr'],
             }
             log_dict.update(collapse_diagnostics(fused.detach(), vis_0, ir_0, vis_N, ir_N, vis_gt, ir_gt, tau))
@@ -368,6 +453,7 @@ def train_epoch(model, loader, optimizer, criterion, device, epoch, global_step,
             temp=f'{loss_dict["loss_temporal"]:.4f}',
             aux_v=f'{loss_dict["loss_aux_vis"]:.4f}',
             aux_i=f'{loss_dict["loss_aux_ir"]:.4f}',
+            aow=f'{loss_dict["loss_aow"]:.4f}',
         )
 
     # Epoch-level averages
@@ -380,6 +466,7 @@ def train_epoch(model, loader, optimizer, criterion, device, epoch, global_step,
             'epoch/loss_temporal': loss_components['loss_temporal'].item(),
             'epoch/loss_aux_vis': loss_components['loss_aux_vis'].item(),
             'epoch/loss_aux_ir': loss_components['loss_aux_ir'].item(),
+            'epoch/loss_aow': loss_components['loss_aow'].item(),
             'epoch/lr': optimizer.param_groups[0]['lr'],
         }
         wandb.log(epoch_metrics, step=global_step)
@@ -399,6 +486,7 @@ def validate(model, loader, criterion, device, global_step, log_images=False):
         'loss_temporal': Averager(),
         'loss_aux_vis': Averager(),
         'loss_aux_ir': Averager(),
+        'loss_aow': Averager(),
     }
     sample_logged = False
     diag_logged = False
@@ -415,9 +503,11 @@ def validate(model, loader, criterion, device, global_step, log_images=False):
         fused = model(vis_0, ir_0, vis_N, ir_N, scale=(1.0, 1.0), tau=tau)
         temporal_loss = model.get_temporal_regularization() if hasattr(model, 'get_temporal_regularization') else None
         aux_outputs = model.get_aux_outputs() if hasattr(model, 'get_aux_outputs') else None
+        aow_loss = model.get_aow_regularization() if hasattr(model, 'get_aow_regularization') else None
         loss, loss_dict = criterion(fused, vis_gt, ir_gt,
                        temporal_loss=temporal_loss,
-                       aux_outputs=aux_outputs)
+                       aux_outputs=aux_outputs,
+                       aow_loss=aow_loss)
         loss_avg.add(loss.item())
         for k in loss_components:
             loss_components[k].add(loss_dict[k])
@@ -427,14 +517,21 @@ def validate(model, loader, criterion, device, global_step, log_images=False):
             wandb.log({f'val/{k.split("/", 1)[1]}': v for k, v in diag.items()}, step=global_step)
             diag_logged = True
 
-        # Log sample images (first batch only)
+        # Log sample images (first batch only), including auxiliary reconstructions
         if log_images and not sample_logged:
             n = min(4, fused.shape[0])
+            aux_vis = aux_outputs.get('vis_tau') if aux_outputs else None
+            aux_ir = aux_outputs.get('ir_tau') if aux_outputs else None
             images = []
             for i in range(n):
+                panels = [vis_gt[i], ir_gt[i], fused[i]]
+                caption = 'vis_gt | ir_gt | fused'
+                if aux_vis is not None:
+                    panels += [aux_vis[i].clamp(0, 1), aux_ir[i].clamp(0, 1)]
+                    caption += ' | aux_vis | aux_ir'
                 images.append(wandb.Image(
-                    torch.cat([vis_gt[i], ir_gt[i], fused[i]], dim=2).clamp(0, 1).cpu(),
-                    caption=f'vis_gt | ir_gt | fused (tau={tau[0]:.2f})'))
+                    torch.cat(panels, dim=2).clamp(0, 1).cpu(),
+                    caption=f'{caption} (tau={tau[0]:.2f})'))
             wandb.log({'val/samples': images}, step=global_step)
             sample_logged = True
 
@@ -447,6 +544,7 @@ def validate(model, loader, criterion, device, global_step, log_images=False):
         'val/loss_temporal': loss_components['loss_temporal'].item(),
         'val/loss_aux_vis': loss_components['loss_aux_vis'].item(),
         'val/loss_aux_ir': loss_components['loss_aux_ir'].item(),
+        'val/loss_aow': loss_components['loss_aow'].item(),
     }, step=global_step)
     return val_loss
 
@@ -524,8 +622,8 @@ def main():
     )
     total_epochs = config.get('epochs', 100)
     warmup_epochs = config.get('warmup_epochs', 5)
-    warmup_scheduler = LambdaLR(optimizer, lr_lambda=lambda ep: min(1.0, (ep + 1) / warmup_epochs))
-    cosine_scheduler = CosineAnnealingLR(optimizer, T_max=total_epochs - warmup_epochs, eta_min=lr * 0.01)
+    warmup_scheduler = LambdaLR(optimizer, lr_lambda=lambda ep: min(1.0, (ep + 1) / max(1, warmup_epochs)))
+    cosine_scheduler = CosineAnnealingLR(optimizer, T_max=max(1, total_epochs - warmup_epochs), eta_min=lr * 0.01)
     scheduler = SequentialLR(optimizer, schedulers=[warmup_scheduler, cosine_scheduler],
                              milestones=[warmup_epochs])
 
@@ -537,6 +635,7 @@ def main():
         lambda_temporal=config.get('lambda_temporal', 0.0),
         lambda_aux_vis=config.get('lambda_aux_vis', 0.0),
         lambda_aux_ir=config.get('lambda_aux_ir', 0.0),
+        lambda_aow=config.get('lambda_aow', 0.0),
     )
     if is_main_process():
         log('Loss weights: '
@@ -545,7 +644,8 @@ def main():
             f'lambda_grad={criterion.lambda_grad}, '
             f'lambda_temporal={criterion.lambda_temporal}, '
             f'lambda_aux_vis={criterion.lambda_aux_vis}, '
-            f'lambda_aux_ir={criterion.lambda_aux_ir}')
+            f'lambda_aux_ir={criterion.lambda_aux_ir}, '
+            f'lambda_aow={criterion.lambda_aow}')
 
     # Resume
     start_epoch = 1
@@ -599,25 +699,48 @@ def main():
                 tau_s = sample_batch['tau'][:4].to(device)
                 sc = sample_batch['scale'][:4].to(device)
                 fused = vis_model(v0, i0, vN, iN, scale=sc, tau=tau_s)
-                # Layout: Row1: vis_t0 | ir_t0 | vis_tN | ir_tN
-                #          Row2: fused  | avg_gt | vis_gt | ir_gt
+                # Layout: Row1: vis_t0 | ir_t0 | vis_tN | ir_tN | flow_heatmap
+                #          Row2: fused  | avg_gt | vis_gt | ir_gt | motion_overlay
                 vgt = sample_batch['vis_gt'][:4].to(device)
                 igt = sample_batch['ir_gt'][:4].to(device)
                 avg_gt = (vgt + igt) / 2.0
+                # Optical flow between anchors (on visible frames)
+                flow_01 = vis_model.spynet(v0, vN)
+                flow_hm = flow_heatmap(flow_01)                      # [B,3,H,W]
+                fused_m = motion_overlay(fused.clamp(0, 1), flow_01)  # [B,3,H,W]
+                # Auxiliary reconstructions (F_tau -> Vi_tau / IR_tau)
+                aux_vis = aux_ir = None
+                if hasattr(vis_model, 'get_aux_outputs'):
+                    aux_out = vis_model.get_aux_outputs()
+                    aux_vis = aux_out.get('vis_tau')
+                    aux_ir = aux_out.get('ir_tau')
                 for j in range(min(4, fused.shape[0])):
-                    row1 = torch.cat([v0[j], i0[j], vN[j], iN[j]], dim=2)
-                    row2 = torch.cat([fused[j].clamp(0,1), avg_gt[j], vgt[j], igt[j]], dim=2)
+                    row1 = torch.cat([v0[j], i0[j], vN[j], iN[j], flow_hm[j]], dim=2)
+                    row2 = torch.cat([fused[j].clamp(0,1), avg_gt[j], vgt[j], igt[j], fused_m[j]], dim=2)
                     grid = torch.cat([row1, row2], dim=1)
+                    if aux_vis is not None:
+                        row3 = torch.cat([
+                            aux_vis[j].clamp(0, 1),
+                            vgt[j],
+                            aux_ir[j].clamp(0, 1),
+                            igt[j],
+                            torch.zeros_like(fused_m[j]),
+                        ], dim=2)
+                        grid = torch.cat([grid, row3], dim=1)
                     save_image(grid, os.path.join(vis_dir, f'epoch{epoch:03d}_sample{j}.png'))
                 try:
                     frame_info = sample_batch['frame_info'][j]
 
                     wandb_images = [wandb.Image(
                         torch.cat([
-                            torch.cat([v0[j], i0[j], vN[j], iN[j]], dim=2),
-                            torch.cat([fused[j].clamp(0,1), avg_gt[j], vgt[j], igt[j]], dim=2),
+                            torch.cat([v0[j], i0[j], vN[j], iN[j], flow_hm[j]], dim=2),
+                            torch.cat([fused[j].clamp(0,1), avg_gt[j], vgt[j], igt[j], fused_m[j]], dim=2),
+                            *((torch.cat([aux_vis[j].clamp(0,1), vgt[j],
+                                          aux_ir[j].clamp(0,1), igt[j],
+                                          torch.zeros_like(fused_m[j])], dim=2),)
+                               if aux_vis is not None else ()),
                         ], dim=1).cpu(),
-                        caption=f'Row1: vis_t0|ir_t0|vis_tN|ir_tN  Row2: fused|avg_gt|vis_gt|ir_gt | {frame_info} | tau={tau_s[j]:.2f}')
+                        caption=f'Row1: vis_t0|ir_t0|vis_tN|ir_tN|flow  Row2: fused|avg_gt|vis_gt|ir_gt|motion  Row3: aux_vis|vis_gt|aux_ir|ir_gt|_ | {frame_info} | tau={tau_s[j]:.2f}')
                         for j in range(min(4, fused.shape[0]))]
                     wandb.log({'train/vis_samples': wandb_images}, step=global_step)
                 except Exception as e:

@@ -4,14 +4,19 @@ M3SVD Temporal Fusion Dataset.
 Large-interval anchor frame sampling for continuous temporal super-resolution
 combined with multi-modal (visible + infrared) image fusion.
 
-Sampling strategy:
+Non-overlapping window sampling:
+    Each video is split into disjoint slots of at most n_max+1 frames. Each
+    dataset index corresponds to one slot, so two samples in the same epoch
+    can NEVER have overlapping windows (avoids near-duplicate inputs such as
+    frames 1-9 vs frames 2-10, which would confuse the model).
+
+Sampling strategy (per slot):
     1. Pick a random video V
     2. Pick random interval N ∈ [N_min, N_max]
-    3. Pick random start frame i ∈ [1, len(V) - N]
-    4. Anchor frames: frame[i], frame[i+N]  → model input
-    5. Pick random intermediate frame k ∈ [1, N-1]
-    6. GT frame: frame[i+k]                 → supervision
-    7. Temporal position: τ = k / N ∈ (0, 1)
+    3. Anchor frames: frame[i], frame[i+N]  → model input (window inside slot)
+    4. Pick random intermediate frame k ∈ [1, N-1]
+    5. GT frame: frame[i+k]                 → supervision
+    6. Temporal position: τ = k / N ∈ (0, 1)
 """
 
 import os
@@ -82,14 +87,20 @@ class M3SVDTemporalFusion(Dataset):
         if len(self.videos) == 0:
             raise RuntimeError(f"No valid videos found in {vis_dir}")
 
-        # For deterministic length: each video contributes (n_frames - n_max) samples
-        self.cumulative_lengths = []
-        total = 0
-        for vid, n_frames in self.videos:
-            count = n_frames - self.n_max
-            total += count
-            self.cumulative_lengths.append(total)
-        self.total_samples = total
+        # Non-overlapping window slots.
+        # Each video is partitioned into disjoint windows of at most n_max+1 frames
+        # (slot span = n_max gaps). A window sampled inside a slot never overlaps a
+        # window from another slot, so within one epoch two samples can never be
+        # near-duplicate (e.g. frames 1-9 AND frames 2-10), which would otherwise
+        # let the model collapse onto near-identical inputs. Each slot yields
+        # exactly ONE sample per epoch.
+        self.locations = []  # list of (video_idx, slot_start) with 1-indexed frames
+        for vi, (_vid, n_frames) in enumerate(self.videos):
+            for start in range(1, n_frames - self.n_max + 1, self.n_max + 1):
+                self.locations.append((vi, start))
+        self.total_samples = len(self.locations)
+        if self.total_samples == 0:
+            raise RuntimeError(f"No non-overlapping windows available in {vis_dir}")
 
     def __len__(self):
         return self.total_samples
@@ -129,21 +140,17 @@ class M3SVDTemporalFusion(Dataset):
         return tensors
 
     def __getitem__(self, idx):
-        # Find which video this index belongs to
-        video_idx = 0
-        for i, cum_len in enumerate(self.cumulative_lengths):
-            if idx < cum_len:
-                video_idx = i
-                break
-
+        # Deterministic slot -> (video, window), guaranteeing that windows from
+        # different slots never overlap (non-overlapping epoch sampling).
+        video_idx, slot_start = self.locations[idx]
         video_id, n_frames = self.videos[video_idx]
 
-        # Random interval N
+        # Random interval N within the slot (window span <= slot span).
         N = random.randint(self.n_min, self.n_max)
 
-        # Random start frame (1-indexed)
-        max_start = n_frames - N
-        i = random.randint(1, max_start)
+        # Random start frame (1-indexed) such that window [i, i+N] stays inside
+        # [slot_start, slot_start + n_max].
+        i = random.randint(slot_start, slot_start + self.n_max - N)
 
         # Random intermediate frame
         k = random.randint(1, N - 1)

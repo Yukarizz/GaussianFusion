@@ -44,56 +44,35 @@ class SinusoidalPosEmb(nn.Module):
 @register('temporal-cross-attention')
 class TemporalCrossAttention(nn.Module):
     """
-    Learnable temporal interpolation with τ conditioning.
+    Paper-aligned Continuous Gaussian Motion (CGM) feature interpolation.
 
-    Instead of fixed (1-τ)·warp(feat_0) + τ·warp(feat_N), this module:
-    1. Warps features using optical flow (like before)
-    2. Uses τ-conditioned attention to learn HOW to blend
-    3. Adds a residual refinement convolution
+    1. Scale bidirectional flow according to tau.
+    2. Warp endpoint features toward target time tau.
+    3. Fuse two warped features with a learnable mask + residual.
 
-    Args:
-        n_feats: Feature channels (default: 64).
-        tau_dim: Dimension of τ positional embedding (default: 64).
-        n_heads: Number of attention heads (default: 4).
+    Optical flow is ONLY used to build the intermediate feature F_tau; it never
+    directly displaces final Gaussian centers (see _render_motion_gaussians).
     """
 
-    def __init__(self, n_feats=64, tau_dim=64, n_heads=4):
+    def __init__(self, n_feats=64, tau_dim=64, n_heads=4, use_occlusion_fusion=False,
+                 occ_gamma=1.0):
         super().__init__()
         self.n_feats = n_feats
-        self.tau_dim = tau_dim
         self.last_reg_loss = None
         self._debug_stats = {}
+        # Inference-side switch: replace the learned (easily-collapsing) soft mask
+        # with a forward-backward-consistency occlusion-aware fusion. This stops
+        # the "two half-transparent objects" ghosting at intermediate times.
+        self.use_occlusion_fusion = use_occlusion_fusion
+        self.occ_gamma = occ_gamma  # steepness of the occlusion soft mask
 
-        # τ positional encoding
-        self.tau_embed = SinusoidalPosEmb(tau_dim)
-        self.tau_mlp = nn.Sequential(
-            nn.Linear(tau_dim, n_feats),
-            nn.GELU(),
-            nn.Linear(n_feats, n_feats),
-        )
-
-        # Attention: query from τ-modulated concat, key/value from warped features
-        # Use lightweight spatial attention (1×1 conv to compute weights)
-        self.q_proj = nn.Conv2d(n_feats, n_feats, 1)
-        self.k0_proj = nn.Conv2d(n_feats, n_feats, 1)
-        self.k1_proj = nn.Conv2d(n_feats, n_feats, 1)
-        self.v0_proj = nn.Conv2d(n_feats, n_feats, 1)
-        self.v1_proj = nn.Conv2d(n_feats, n_feats, 1)
-
-        # Temporal blending weight prediction (per-pixel, per-channel)
-        self.blend_conv = nn.Sequential(
-            nn.Conv2d(n_feats * 3, n_feats, 3, padding=1),
+        # Warped endpoint features (2*C) + tau map (1) -> mask (1) + residual (C)
+        self.fusion_head = nn.Sequential(
+            nn.Conv2d(n_feats * 2 + 1, n_feats, 3, padding=1),
             nn.LeakyReLU(0.1, inplace=True),
             nn.Conv2d(n_feats, n_feats, 3, padding=1),
             nn.LeakyReLU(0.1, inplace=True),
-            nn.Conv2d(n_feats, 2, 1),  # 2 weights: w0, w1
-        )
-
-        # Refinement after blending
-        self.refine = nn.Sequential(
-            nn.Conv2d(n_feats, n_feats, 3, padding=1),
-            nn.LeakyReLU(0.1, inplace=True),
-            nn.Conv2d(n_feats, n_feats, 3, padding=1),
+            nn.Conv2d(n_feats, n_feats + 1, 3, padding=1),
         )
 
     def forward(self, feat_0, feat_1, flow_01, flow_10, tau, occ_threshold=5.0):
@@ -103,113 +82,82 @@ class TemporalCrossAttention(nn.Module):
             feat_1: Features at frame N [B, C, H, W].
             flow_01: Flow from frame 0 to frame N [B, 2, H, W].
             flow_10: Flow from frame N to frame 0 [B, 2, H, W].
-            tau: Temporal position [B] or scalar.
-            occ_threshold: Not used (kept for API compatibility).
+            tau: Temporal position in (0,1). Scalar or Tensor [B].
+            occ_threshold: Unused (kept for API compatibility).
 
         Returns:
-            Interpolated features at time τ [B, C, H, W].
+            Interpolated features at time tau [B, C, H, W].
         """
         B, C, H, W = feat_0.shape
 
-        # Handle tau format
-        if isinstance(tau, torch.Tensor) and tau.dim() >= 1:
-            t_b = tau.view(-1, 1, 1, 1).to(feat_0.device)
-            tau_flat = tau.to(feat_0.device)
+        # Normalize tau to a per-sample tensor [B]
+        if not isinstance(tau, torch.Tensor):
+            tau = torch.full((B,), float(tau), device=feat_0.device, dtype=feat_0.dtype)
+        elif tau.dim() == 0:
+            tau = tau.reshape(1).expand(B)
+        tau = tau.to(device=feat_0.device, dtype=feat_0.dtype)
+
+        t = tau.view(B, 1, 1, 1)
+
+        # ======================================================
+        # 1. tau-conditioned flow scaling
+        # ======================================================
+        # flow_warp(x, f) samples x at (p + f(p)), i.e. f must be the displacement
+        # from the OUTPUT coordinate back to the INPUT coordinate (backward flow).
+        # flow_01 / flow_10 are FORWARD flows (source -> target), so they must be
+        # negated before warping an endpoint feature to the intermediate time tau.
+        flow_0t = -t * flow_01          # tau -> frame 0
+        flow_1t = -(1.0 - t) * flow_10  # tau -> frame N
+
+        # ======================================================
+        # 2. Backward warping of endpoint features to time tau
+        # ======================================================
+        warped_0 = flow_warp(feat_0, flow_0t)
+        warped_1 = flow_warp(feat_1, flow_1t)
+
+        # ======================================================
+        # 3. Feature fusion (mask + residual)
+        # ======================================================
+        tau_map = t.expand(B, 1, H, W)
+
+        if getattr(self, 'use_occlusion_fusion', False):
+            # ---- Occlusion-aware fusion (no learned mask) ----
+            # Forward-backward consistency: a pixel at tau is "reliable from
+            # endpoint 0" if its forward flow agrees with the backward flow.
+            # Where they disagree (occlusion / disocclusion), the other endpoint
+            # is trusted instead, avoiding the 0.5-blend ghosting.
+            # NOTE: flow_10 must be resampled to tau using the same (negated)
+            # backward displacement that built warped_0.
+            flow_10_at_0 = flow_warp(flow_10, flow_0t)       # bwd flow resampled to tau
+            fb_err = (flow_01 + flow_10_at_0).norm(dim=1, keepdim=True)  # [B,1,H,W]
+            # confidence of endpoint-0 content at this tau position
+            c0 = torch.exp(-self.occ_gamma * fb_err).clamp(0, 1)   # high where consistent
+            c1 = 1.0 - c0
+            denom = c0 + c1 + 1e-8
+            w0 = c0 / denom
+            w1 = c1 / denom
+            feat_tau = w0 * warped_0 + w1 * warped_1
+
+            # Still apply the residual head (trained) for texture refinement.
+            fusion_input = torch.cat([warped_0, warped_1, tau_map], dim=1)
+            pred = self.fusion_head(fusion_input)
+            residual = pred[:, 1:]
+            feat_tau = feat_tau + residual
+            mask = w0
         else:
-            t_b = float(tau)
-            tau_flat = torch.tensor([tau], device=feat_0.device).expand(B)
+            # ---- Original learned-mask path ----
+            fusion_input = torch.cat([warped_0, warped_1, tau_map], dim=1)
+            pred = self.fusion_head(fusion_input)
+            mask = torch.sigmoid(pred[:, 0:1])
+            residual = pred[:, 1:]
+            feat_tau = mask * warped_0 + (1.0 - mask) * warped_1 + residual
 
-
-        t = t_b
-        one_minus_t = 1.0 - t
-        temp = -t * one_minus_t
-
-        # 1.1 Calculate basic Super-SloMo approximate flows
-        # These flows are mathematically sound in magnitude, but spatially misaligned
-        flow_t0_approx = temp * flow_01 + (t * t) * flow_10
-        flow_t1_approx = (one_minus_t * one_minus_t) * flow_01 + temp * flow_10
-
-        # 1.2 Warp the base flows to align them to the intermediate grid t
-        # We use the approximate intermediate flows to fetch the true vectors from anchor frames
-        flow_01_at_t = flow_warp(flow_01, flow_t0_approx)
-        flow_10_at_t = flow_warp(flow_10, flow_t1_approx)
-
-        # 1.3 Recalculate accurate intermediate flows using the spatially aligned base flows
-        flow_t0_aligned = temp * flow_01_at_t + (t * t) * flow_10_at_t
-        flow_t1_aligned = (one_minus_t * one_minus_t) * flow_01_at_t + temp * flow_10_at_t
-
-        # 1.4 Finally, warp the image features using the perfectly aligned flows
-        warped_0 = flow_warp(feat_0, flow_t0_aligned)  # [B, C, H, W]
-        warped_1 = flow_warp(feat_1, flow_t1_aligned)  # [B, C, H, W]
-
-        # Step 2: τ conditioning
-        tau_emb = self.tau_embed(tau_flat)       # [B, tau_dim]
-        tau_feat = self.tau_mlp(tau_emb)         # [B, n_feats]
-        tau_spatial = tau_feat.unsqueeze(-1).unsqueeze(-1)  # [B, C, 1, 1]
-
-        # Step 3: Compute attention-based blending weights
-        # Query: τ-modulated average of warped features
-        query = (warped_0 + warped_1) / 2.0 + tau_spatial  # [B, C, H, W]
-        query = self.q_proj(query)
-
-        k0 = self.k0_proj(warped_0)
-        k1 = self.k1_proj(warped_1)
-
-        # Per-pixel channel-wise attention score
-        attn_0 = (query * k0).sum(dim=1, keepdim=True) / math.sqrt(C)  # [B, 1, H, W]
-        attn_1 = (query * k1).sum(dim=1, keepdim=True) / math.sqrt(C)  # [B, 1, H, W]
-
-        # Also compute explicit blending weights from context
-        ctx = torch.cat([warped_0, warped_1, query], dim=1)  # [B, 3C, H, W]
-        blend_logits = self.blend_conv(ctx)  # [B, 2, H, W]
-
-        # Combine attention + explicit blend (both contribute)
-        w = torch.softmax(
-            torch.stack([attn_0.squeeze(1) + blend_logits[:, 0],
-                         attn_1.squeeze(1) + blend_logits[:, 1]], dim=1),
-            dim=1
-        )  # [B, 2, H, W]
-
-        w0 = w[:, 0:1]  # [B, 1, H, W]
-        w1 = w[:, 1:2]  # [B, 1, H, W]
-
-        # Differentiable anti-collapse regularization.
-        # The target is a soft temporal prior, not a hard constraint:
-        # earlier τ should lean to frame 0, later τ should lean to frame N.
-        tau_prior = tau_flat.view(B, 1, 1, 1).to(device=w.device, dtype=w.dtype)
-        target_w = torch.cat([1.0 - tau_prior, tau_prior], dim=1).expand_as(w)
-        prior_loss = F.smooth_l1_loss(w, target_w)
-
-        # Keep attention from becoming one-hot too early, especially near mid-time.
-        # Maximum 2-way entropy is log(2); required entropy is relaxed near boundaries.
-        w_safe = w.clamp_min(1e-6)
-        entropy = -(w_safe * w_safe.log()).sum(dim=1)  # [B, H, W]
-        midness = (1.0 - (2.0 * tau_flat - 1.0).abs()).view(B, 1, 1).to(entropy.dtype)
-        min_entropy = 0.35 * midness
-        entropy_loss = F.relu(min_entropy - entropy).mean()
-        self.last_reg_loss = prior_loss + 0.1 * entropy_loss
-
+        self.last_reg_loss = None
         with torch.no_grad():
-            max_w = w.max(dim=1).values
             self._debug_stats = {
-                'w0_mean': w0.mean().item(),
-                'w1_mean': w1.mean().item(),
-                'w0_std': w0.std().item(),
-                'w1_std': w1.std().item(),
-                'target_w0_mean': (1.0 - tau_flat).mean().item(),
-                'target_w1_mean': tau_flat.mean().item(),
-                'entropy_mean': entropy.mean().item(),
-                'dominance_frac': (max_w > 0.9).float().mean().item(),
-                'prior_loss': prior_loss.detach().item(),
-                'entropy_loss': entropy_loss.detach().item(),
+                'mask_mean': mask.mean().item(),
+                'residual_abs_mean': residual.abs().mean().item(),
+                'tau_mean': tau.mean().item(),
             }
 
-        # Step 4: Weighted blend with value projections
-        v0 = self.v0_proj(warped_0)
-        v1 = self.v1_proj(warped_1)
-        blended = w0 * v0 + w1 * v1  # [B, C, H, W]
-
-        # Step 5: Residual refinement
-        out = blended + self.refine(blended)
-
-        return out
+        return feat_tau

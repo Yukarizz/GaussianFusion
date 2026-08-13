@@ -13,8 +13,8 @@ from itertools import product
 
 import models
 from models import register
-from warp_utils import flow_warp
 from models.temporal_attention import SinusoidalPosEmb
+from warp_utils import flow_warp
 
 from gsplat.project_gaussians_2d import project_gaussians_2d
 from gsplat.rasterize_sum import rasterize_gaussians_sum
@@ -119,16 +119,48 @@ class GaussianFusion(nn.Module):
     """
 
     def __init__(self, encoder_spec, spynet_pretrained='sintel-final',
+                 flow_model='spynet', searaft_pretrained=None,
                  n_feats=64, freeze_spynet=True, occ_threshold=1.0,
                  gaussian_render_mode='blend', fb_confidence_scale=None,
                  fb_confidence_floor=0.2,
                  motion_force_dense=False,
                  motion_dense_mode='none', motion_flow_smooth_kernel=3,
                  motion_pair_merge=True,
-                 tau_gaussian_opacity=0.5):
+                 tau_gaussian_opacity=0.5,
+                 full_res_color=False,
+                 flow_driven_xyz=False,
+                 occ_fusion=False,
+                 occ_gamma=1.0,
+                 motion_window_gain=4.0,
+                 motion_window_max=10.0,
+                 motion_window_flow_ref=20.0):
         super().__init__()
+        self.flow_model = flow_model
+        self.occ_fusion_enabled = occ_fusion
+        self.occ_gamma = occ_gamma
+        # Motion-aware window modulation: enlarge the AOW offset window where the
+        # optical flow magnitude is large, so the tanh-limited offset can cover the
+        # true object displacement (the paper forbids driving xyz with flow directly).
+        self.motion_window_gain = motion_window_gain
+        self.motion_window_max = motion_window_max
+        self.motion_window_flow_ref = motion_window_flow_ref
 
         self.n_feats = n_feats
+        # Inference switch: predict color on the full-res F_tau instead of the
+        # PixelUnshuffle(2) grid, which loses small moving-object details.
+        # Weights are untrained by default (random init); useful for ablation.
+        self.full_res_color = full_res_color
+        # Inference switch: drive Gaussian centers by tau-scaled optical flow so
+        # moving objects truly translate to their intermediate position.
+        # Without this, centers stay on the static grid and the object is
+        # "averaged out" instead of moved.
+        self.flow_driven_xyz = flow_driven_xyz
+        # Runtime flag: set after loading a checkpoint that trained this head,
+        # so demo/inference only uses full-res color when the weights exist.
+        self.full_res_color_trained = False
+        # Compressed Gaussian latent: channels after PixelUnshuffle(2).
+        self.gau_feats = 4 * n_feats        # e.g. n_feats=48 -> 192
+        self.cov_dim = 2 * self.gau_feats   # covariance embedding dim (384 for 48)
         self.occ_threshold = occ_threshold
         self.gaussian_render_mode = gaussian_render_mode
         self.fb_confidence_scale = fb_confidence_scale or occ_threshold
@@ -140,11 +172,18 @@ class GaussianFusion(nn.Module):
         self.tau_gaussian_opacity = tau_gaussian_opacity
         self.BLOCK_H, self.BLOCK_W = 16, 16
 
-        # --- SpyNet for optical flow ---
-        self.spynet = models.make({
-            'name': 'spynet',
-            'args': {'pretrained': spynet_pretrained}
-        })
+        # --- Optical flow model (SpyNet or SEA-RAFT) ---
+        # Kept as self.spynet for backward compatibility with forward().
+        if flow_model == 'searaft':
+            self.spynet = models.make({
+                'name': 'searaft',
+                'args': {'pretrained': searaft_pretrained, 'freeze': freeze_spynet}
+            })
+        else:
+            self.spynet = models.make({
+                'name': 'spynet',
+                'args': {'pretrained': spynet_pretrained}
+            })
         if freeze_spynet:
             for p in self.spynet.parameters():
                 p.requires_grad = False
@@ -166,7 +205,9 @@ class GaussianFusion(nn.Module):
         # --- Temporal cross-attention (learnable, τ-conditioned) ---
         self.temporal_attn = models.make({
             'name': 'temporal-cross-attention',
-            'args': {'n_feats': n_feats, 'tau_dim': 64}
+            'args': {'n_feats': n_feats, 'tau_dim': 64,
+                     'use_occlusion_fusion': self.occ_fusion_enabled,
+                     'occ_gamma': self.occ_gamma}
         })
 
         # --- Cross-modal fusion ---
@@ -175,56 +216,71 @@ class GaussianFusion(nn.Module):
             'args': {'in_channels': n_feats}
         })
 
-        # --- Auxiliary temporal reconstruction heads ---
-        # These heads force per-modality temporal features to reconstruct the
-        # intermediate visible / infrared targets before cross-modal fusion.
+        # --- Auxiliary reconstruction heads: F_tau -> Vi_tau / IR_tau ---
+        # Reconstructing the intermediate-time visible & infrared images from the
+        # fused feature forces F_tau to retain BOTH modalities' intermediate
+        # content (otherwise the temporal/mask fusion can "fade out" one modal).
         self.aux_vis_decoder = nn.Sequential(
             nn.Conv2d(n_feats, n_feats, kernel_size=3, padding=1),
             nn.LeakyReLU(0.1, inplace=True),
+            nn.Conv2d(n_feats, n_feats, kernel_size=3, padding=1),
+            nn.LeakyReLU(0.1, inplace=True),
             nn.Conv2d(n_feats, 3, kernel_size=3, padding=1),
-            nn.Sigmoid(),
         )
         self.aux_ir_decoder = nn.Sequential(
             nn.Conv2d(n_feats, n_feats, kernel_size=3, padding=1),
             nn.LeakyReLU(0.1, inplace=True),
+            nn.Conv2d(n_feats, n_feats, kernel_size=3, padding=1),
+            nn.LeakyReLU(0.1, inplace=True),
             nn.Conv2d(n_feats, 3, kernel_size=3, padding=1),
-            nn.Sigmoid(),
         )
 
         # --- Gaussian prediction head (reused from ContinuousSR) ---
-        self.ps = nn.PixelUnshuffle(2)  # 64ch -> 256ch, spatial /2
-        self.conv1 = nn.Conv2d(256, 512, kernel_size=3, padding=1)
+        self.ps = nn.PixelUnshuffle(2)  # n_feats -> 4*n_feats (gau_feats), spatial /2
+        self.conv1 = nn.Conv2d(self.gau_feats, self.cov_dim, kernel_size=3, padding=1)
         self.leaky_relu = nn.LeakyReLU(negative_slope=0.01)
 
-        # MLP for Gaussian dictionary vector projection
+        # MLP for Gaussian dictionary vector projection (Covariance Prior Bank embedding)
         mlp_vector_spec = {'name': 'mlp', 'args': {
-            'in_dim': 3, 'out_dim': 512, 'hidden_list': [256, 512, 512, 512]
+            'in_dim': 3, 'out_dim': self.cov_dim,
+            'hidden_list': [self.cov_dim // 2, self.cov_dim, self.cov_dim]
         }}
         self.mlp_vector = models.make(mlp_vector_spec)
 
-        # Convolutional heads for color and offset prediction. A signed relative
-        # tau channel is concatenated with feat_ps so endpoint direction remains explicit.
+        # Convolutional heads for color and offset prediction. A real (signed) tau
+        # channel is concatenated with feat_ps so the temporal position stays explicit.
         self.conv_color = nn.Sequential(
-            nn.Conv2d(257, 256, kernel_size=3, padding=1),
+            nn.Conv2d(self.gau_feats + 1, self.gau_feats, kernel_size=3, padding=1),
             nn.LeakyReLU(0.1, inplace=True),
-            nn.Conv2d(256, 128, kernel_size=3, padding=1),
+            nn.Conv2d(self.gau_feats, self.gau_feats // 2, kernel_size=3, padding=1),
             nn.LeakyReLU(0.1, inplace=True),
-            nn.Conv2d(128, 3, kernel_size=1),
+            nn.Conv2d(self.gau_feats // 2, 3, kernel_size=1),
         )
         self.conv_offset = nn.Sequential(
-            nn.Conv2d(257, 256, kernel_size=3, padding=1),
+            nn.Conv2d(self.gau_feats + 1, self.gau_feats, kernel_size=3, padding=1),
             nn.LeakyReLU(0.1, inplace=True),
-            nn.Conv2d(256, 128, kernel_size=3, padding=1),
+            nn.Conv2d(self.gau_feats, self.gau_feats // 2, kernel_size=3, padding=1),
             nn.LeakyReLU(0.1, inplace=True),
-            nn.Conv2d(128, 2, kernel_size=1),
+            nn.Conv2d(self.gau_feats // 2, 2, kernel_size=1),
+        )
+
+        # Full-resolution color head (inference-only switch full_res_color=True).
+        # Operates on F_tau at full res (before PixelUnshuffle) to preserve small
+        # moving-object details that the coarse ps grid averages away.
+        self.conv_color_full = nn.Sequential(
+            nn.Conv2d(n_feats + 1, n_feats, kernel_size=3, padding=1),
+            nn.LeakyReLU(0.1, inplace=True),
+            nn.Conv2d(n_feats, n_feats // 2, kernel_size=3, padding=1),
+            nn.LeakyReLU(0.1, inplace=True),
+            nn.Conv2d(n_feats // 2, 3, kernel_size=1),
         )
 
         # --- τ conditioning for Gaussian head (FiLM modulation) ---
         self.tau_embed = SinusoidalPosEmb(64)
         self.tau_film = nn.Sequential(
-            nn.Linear(64, 256),
+            nn.Linear(64, self.gau_feats),
             nn.GELU(),
-            nn.Linear(256, 256 * 2),  # γ and β for FiLM on 256-ch features
+            nn.Linear(self.gau_feats, self.gau_feats * 2),  # γ and β for FiLM
         )
 
         # Pre-defined Gaussian covariance dictionary (730 templates)
@@ -235,13 +291,12 @@ class GaussianFusion(nn.Module):
         gau_dict = torch.cat((gau_dict, torch.zeros(1, 3)), dim=0)  # [730, 3]
         self.register_buffer('gau_dict', gau_dict)
 
-        num_prior_kernels = self.gau_dict.shape[0] 
-        
-        self.cram_projection = nn.Sequential(
-            nn.Linear(num_prior_kernels * 2 + 1, 256),
-            nn.LeakyReLU(0.1, inplace=True),
-            nn.Linear(256, num_prior_kernels) # 输出融合后的新打分
-        )
+        num_prior_kernels = self.gau_dict.shape[0]
+
+        # CRA (Covariance Resampling Alignment) projection.
+        # Input : [Sigma_0, Sigma_N, tau] = 3 + 3 + 1 = 7 dims
+        # Output: logits over the Covariance Prior Bank (K = 730)
+        self.cra_projection = nn.Linear(3 * 2 + 1, num_prior_kernels)
         self.background = None  # Lazy init on correct device
         self._temporal_reg_loss = None
         self._temporal_stats = {}
@@ -302,15 +357,15 @@ class GaussianFusion(nn.Module):
         # (scale>1), the compact fh/2 × fw/2 grid becomes too sparse in the HR
         # canvas and produces periodic low-coverage gaps. Densify to one Gaussian
         # per LR pixel for scale>1 to avoid grid-like holes between samples.
-        feat_ps = self.ps(feat)  # [B, C*4, fh/2, fw/2] = [B, 256, fh/2, fw/2]
+        feat_ps = self.ps(feat)  # [B, C*4, fh/2, fw/2] = [B, gau_feats, fh/2, fw/2]
 
         # τ FiLM modulation: condition Gaussian features on temporal position
         tau_t = self._expand_tau(tau, bs, feat.device)
         if tau_t is not None:
-            tau_emb = self.tau_embed(tau_t.float())  # [B, 64]
-            film_params = self.tau_film(tau_emb)     # [B, 512]
-            gamma = film_params[:, :256].unsqueeze(-1).unsqueeze(-1) + 1.0  # [B, 256, 1, 1]
-            beta = film_params[:, 256:].unsqueeze(-1).unsqueeze(-1)         # [B, 256, 1, 1]
+            tau_emb = self.tau_embed(tau_t.float())                 # [B, 64]
+            film_params = self.tau_film(tau_emb)                    # [B, 2*gau_feats]
+            gamma = film_params[:, :self.gau_feats].unsqueeze(-1).unsqueeze(-1) + 1.0
+            beta = film_params[:, self.gau_feats:].unsqueeze(-1).unsqueeze(-1)
             feat_ps = gamma * feat_ps + beta
 
         dense_sr_render = dense_mode in ('full', 'vertical') or max(scale_h, scale_w) > 1.0
@@ -327,8 +382,8 @@ class GaussianFusion(nn.Module):
         ps_h, ps_w = feat_ps.shape[2], feat_ps.shape[3]
         n_gaussians = ps_h * ps_w
 
-        # Reshape: [B, 256, ps_h, ps_w] -> [B*ps_h*ps_w, 256]
-        feat_flat = feat_ps.permute(0, 2, 3, 1).reshape(bs * n_gaussians, 256)
+        # Reshape: [B, gau_feats, ps_h, ps_w] -> [B*ps_h*ps_w, gau_feats]
+        feat_flat = feat_ps.permute(0, 2, 3, 1).reshape(bs * n_gaussians, self.gau_feats)
 
         tau_t = self._expand_tau(tau, bs, feat_ps.device)
         if tau_t is None:
@@ -348,10 +403,10 @@ class GaussianFusion(nn.Module):
         # Covariance via dictionary (same mechanism as ContinuousSR)
         # Detach features to prevent encoder side-effects on covariance
         para_feat = self.leaky_relu(feat_ps.detach())
-        para_conv = self.conv1(para_feat)  # [B, 512, ps_h, ps_w]
-        para_flat = para_conv.permute(0, 2, 3, 1).reshape(bs * n_gaussians, 512)
+        para_conv = self.conv1(para_feat)  # [B, cov_dim, ps_h, ps_w]
+        para_flat = para_conv.permute(0, 2, 3, 1).reshape(bs * n_gaussians, self.cov_dim)
 
-        vector = self.mlp_vector(self.gau_dict)  # [730, 512]
+        vector = self.mlp_vector(self.gau_dict)  # [730, cov_dim]
         similarity = vector @ para_flat.t()  # [730, B*n_gaussians]
         # 对先验字典的打分权重
         weights = torch.softmax(similarity, dim=0)  # [730, B*n_gaussians]
@@ -403,19 +458,15 @@ class GaussianFusion(nn.Module):
         return torch.cat((xyz_x, xyz_y), dim=2)
 
     def _flow_to_gaussian_grid(self, flow, ps_h, ps_w):
+        """Downsample flow to the Gaussian (ps) grid -> [B, N, 2] pixel units."""
         flow_ps = F.interpolate(flow, size=(ps_h, ps_w), mode='bilinear', align_corners=True)
         return flow_ps.permute(0, 2, 3, 1).reshape(flow.shape[0], ps_h * ps_w, 2)
 
-    def _smooth_motion_flow(self, flow):
-        kernel = int(self.motion_flow_smooth_kernel)
-        if kernel <= 1:
-            return flow
-        if kernel % 2 == 0:
-            kernel += 1
-        return F.avg_pool2d(flow, kernel_size=kernel, stride=1, padding=kernel // 2)
-
     def _compute_fb_confidence(self, flow_01, flow_10):
-        """Continuous forward-backward confidence maps for both endpoints."""
+        """Forward-backward consistency confidence for both directions.
+
+        Returns (conf_0, conf_1) in [conf_floor, 1]; high = reliable.
+        """
         flow_10_at_1 = flow_warp(flow_10, flow_01)
         flow_01_at_0 = flow_warp(flow_01, flow_10)
         cons_0 = torch.norm(flow_01 + flow_10_at_1, dim=1, keepdim=True)
@@ -424,14 +475,15 @@ class GaussianFusion(nn.Module):
         conf_floor = float(self.fb_confidence_floor)
         conf_0 = torch.exp(-cons_0 / sigma).clamp(conf_floor, 1.0)
         conf_1 = torch.exp(-cons_1 / sigma).clamp(conf_floor, 1.0)
-        return conf_0, conf_1, cons_0, cons_1
-
-    def _confidence_to_gaussian_grid(self, confidence, ps_h, ps_w):
-        conf_ps = F.interpolate(confidence, size=(ps_h, ps_w), mode='bilinear', align_corners=True)
-        return conf_ps.permute(0, 2, 3, 1).reshape(confidence.shape[0], ps_h * ps_w, 1)
+        return conf_0, conf_1
 
     def _apply_flow_motion(self, xyz, flow, tau_weight, ps_h, ps_w):
-        flow_flat = self._flow_to_gaussian_grid(flow, ps_h, ps_w)
+        """Displace Gaussian centers by tau-scaled flow (in normalized coords).
+
+        xyz is in [-1,1] normalized coords; flow is in pixels. We convert the
+        displacement to normalized units using the ps grid resolution.
+        """
+        flow_flat = self._flow_to_gaussian_grid(flow, ps_h, ps_w)   # [B, N, 2] px
         if not isinstance(tau_weight, torch.Tensor):
             tau_weight = torch.tensor(tau_weight, device=xyz.device, dtype=xyz.dtype)
         tau_weight = tau_weight.to(device=xyz.device, dtype=xyz.dtype).view(-1, 1, 1)
@@ -440,6 +492,112 @@ class GaussianFusion(nn.Module):
         disp_y = 2 * tau_weight * flow_flat[:, :, 1:2] / flow_h
         return xyz + torch.cat((disp_x, disp_y), dim=2)
 
+    def _confidence_to_gaussian_grid(self, confidence, ps_h, ps_w):
+        conf_ps = F.interpolate(confidence, size=(ps_h, ps_w), mode='bilinear', align_corners=True)
+        return conf_ps.permute(0, 2, 3, 1).reshape(confidence.shape[0], ps_h * ps_w, 1)
+
+    def _flow_displacement_to_xyz(self, flow, tau_weight, ps_h, ps_w, H, W):
+        """Flow-driven Gaussian displacement -> normalized coords delta."""
+        flow_flat = self._flow_to_gaussian_grid(flow, ps_h, ps_w)   # [B,N,2] px
+        if not isinstance(tau_weight, torch.Tensor):
+            tau_weight = torch.tensor(tau_weight, device=flow.device, dtype=flow.dtype)
+        tau_weight = tau_weight.to(device=flow.device, dtype=flow.dtype).view(-1, 1, 1)
+        # Convert pixel displacement to normalized [-1,1] delta (grid spacing ~ 2/ps).
+        disp_x = 2 * tau_weight * flow_flat[:, :, 0:1] / ps_w
+        disp_y = 2 * tau_weight * flow_flat[:, :, 1:2] / ps_h
+        return torch.cat((disp_x, disp_y), dim=2)
+
+    def _predict_color_offset(self, feat_ps, tau):
+        """
+        Predict color / offset directly from the intermediate-time feature F_tau.
+
+        Color : C_rgb,tau = H_c(F_tau, tau)
+        Offset: dmu_tau   = tanh(H_mu(F_tau, tau)) ⊙ W_map   (AOW-adjusted)
+
+        Returns dict: color [B, N, 3], offset [B, N, 2], ps_h, ps_w, n_gaussians.
+        """
+        bs, _, ps_h, ps_w = feat_ps.shape
+        n_gaussians = ps_h * ps_w
+
+        tau_t = self._expand_tau(tau, bs, feat_ps.device)
+        if tau_t is None:
+            tau_t = feat_ps.new_zeros(bs)
+        tau_channel = tau_t.to(dtype=feat_ps.dtype).view(bs, 1, 1, 1).expand(-1, 1, ps_h, ps_w)
+        param_feat = torch.cat([feat_ps, tau_channel], dim=1)
+
+        # ---- Color ----
+        color_map = self.conv_color(param_feat)
+        color = torch.sigmoid(
+            color_map.permute(0, 2, 3, 1).reshape(bs, n_gaussians, 3) - 2.0
+        )
+
+        # ---- Initial offset (tanh in [-1, 1]) ----
+        offset_map = torch.tanh(self.conv_offset(param_feat))
+
+        # ---- Adaptive Offset Window (AOW): dmu = dmu_tilde ⊙ W_map ----
+        if hasattr(self, 'current_w_map') and self.current_w_map is not None:
+            w_map = self.current_w_map  # [B, 1, H, W]
+            if w_map.shape[-2:] != (ps_h, ps_w):
+                w_map = F.interpolate(w_map, size=(ps_h, ps_w), mode='nearest')
+            offset_map = offset_map * w_map
+
+        offset = offset_map.permute(0, 2, 3, 1).reshape(bs, n_gaussians, 2)
+
+        return {
+            'color': color,
+            'offset': offset,
+            'ps_h': ps_h,
+            'ps_w': ps_w,
+            'n_gaussians': n_gaussians,
+        }
+
+    def _predict_endpoint_covariance(self, feat_ps):
+        """
+        Predict endpoint covariance from an anchor feature (F_0 or F_N) via the
+        Covariance Prior Bank (CPB).
+
+        Returns (covariance [B, N, 3], kernel_weights [B, N, K]).
+        """
+        bs, _, ps_h, ps_w = feat_ps.shape
+        n_gaussians = ps_h * ps_w
+
+        para_feat = self.leaky_relu(feat_ps.detach())
+        para_conv = self.conv1(para_feat)  # [B, cov_dim, ps_h, ps_w]
+        para_flat = para_conv.permute(0, 2, 3, 1).reshape(bs * n_gaussians, self.cov_dim)
+
+        vector = self.mlp_vector(self.gau_dict)  # [K, cov_dim]
+        similarity = vector @ para_flat.t()      # [K, B*n_gaussians]
+        weights = torch.softmax(similarity, dim=0)  # [K, B*n_gaussians]
+
+        kernel_weights = weights.t().reshape(bs, n_gaussians, -1)  # [B, N, K]
+        covariance = (weights.t() @ self.gau_dict).reshape(bs, n_gaussians, 3)  # [B, N, 3]
+        return covariance, kernel_weights
+
+    def _cra_resample_covariance(self, cov_0, cov_N, tau):
+        """
+        CRA (Covariance Resampling Alignment).
+
+        E_tau     = P([Sigma_0, Sigma_N, tau])       # projection -> logits [B, N, K]
+        w_tau     = Softmax(E_tau)
+        Sigma_tau = sum_k w_tau,k * Sigma_k_prior    # weighted prior recombination
+
+        Returns (cov_tau [B, N, 3], weights [B, N, K]).
+        """
+        bs, n_gaussians, _ = cov_0.shape
+
+        tau_t = self._expand_tau(tau, bs, cov_0.device)
+        if tau_t is None:
+            tau_t = cov_0.new_zeros(bs)
+        tau_expand = tau_t.to(dtype=cov_0.dtype).view(bs, 1, 1).expand(bs, n_gaussians, 1)
+
+        cra_input = torch.cat([cov_0, cov_N, tau_expand], dim=-1)  # [B, N, 7]
+
+        logits = self.cra_projection(cra_input)                     # [B, N, K]
+        weights = torch.softmax(logits, dim=-1)                     # [B, N, K]
+        cov_tau = weights @ self.gau_dict.to(dtype=weights.dtype)   # [B, N, 3]
+
+        return cov_tau, weights
+
     @torch.amp.custom_fwd(cast_inputs=torch.float32, device_type='cuda')
     def _render_gaussian_params(self, color_all, cov_all, xyz_all, opacity_all,
                                 scale_h, scale_w, H, W, dense_sr_render,
@@ -447,9 +605,9 @@ class GaussianFusion(nn.Module):
         """Rasterize already-positioned Gaussian parameters."""
         bs, n_gaussians = color_all.shape[:2]
 
-        # Rasterize per batch
-        if self.background is None or self.background.device != color_all.device:
-            self.background = torch.zeros(3, device=color_all.device)
+        # Rasterize per batch. A fresh local background avoids caching an
+        # inference-mode tensor (which would break training backward later).
+        background = torch.zeros(3, device=color_all.device, dtype=color_all.dtype)
 
         tile_bounds = (
             (W + self.BLOCK_W - 1) // self.BLOCK_W,
@@ -482,7 +640,7 @@ class GaussianFusion(nn.Module):
                 xys, depths, radii, conics, num_tiles_hit,
                 color_i, opacity, H, W,
                 self.BLOCK_H, self.BLOCK_W,
-                background=self.background, return_alpha=False
+                background=background, return_alpha=False
             )
             # Rasterize weights (denominator) for normalization
             ones_color = torch.ones_like(color_i)
@@ -490,7 +648,7 @@ class GaussianFusion(nn.Module):
                 xys, depths, radii, conics, num_tiles_hit,
                 ones_color, opacity, H, W,
                 self.BLOCK_H, self.BLOCK_W,
-                background=self.background, return_alpha=False
+                background=background, return_alpha=False
             )
             # Normalized output. Motion-shifted Gaussians can leave thin
             # low-coverage rows; avoid turning those rows into hard black lines.
@@ -550,19 +708,25 @@ class GaussianFusion(nn.Module):
                                 scale_h, scale_w, lr_h, lr_w, tau,
                                 feat_fused_tau=None):
         """
-        Motion-aware Gaussian rendering.
+        Paper-aligned Gaussian parameter generation.
 
-        Use fused intermediate tau feature to predict one set of Gaussian parameters.
-        Endpoint features are only used to estimate motion-aligned Gaussian centers.
+        Branch A (color / offset):
+            F_tau -> color_tau / offset_tau;  AOW scales the offset;
+            mu_tau = grid + offset_tau.
+
+        Branch B (covariance):
+            F_0 -> Sigma_0,  F_N -> Sigma_N  (via Covariance Prior Bank);
+            CRA(Sigma_0, Sigma_N, tau) -> Sigma_tau.
+
+        Optical flow was already used to build F_tau; it is NOT applied to xyz here
+        (no double motion compensation).
         """
-        bs = feat_fused_0.shape[0]
-        device = feat_fused_0.device
+        bs = feat_fused_tau.shape[0]
+        device = feat_fused_tau.device
         H = round(lr_h * scale_h)
         W = round(lr_w * scale_w)
 
         tau_t = self._expand_tau(tau, bs, device)
-        one_minus_tau = 1.0 - tau_t
-        rel_tau_target = torch.zeros_like(tau_t)
 
         if feat_fused_tau is None:
             feat_fused_tau = 0.5 * (feat_fused_0 + feat_fused_N)
@@ -572,122 +736,111 @@ class GaussianFusion(nn.Module):
         else:
             dense_mode = self.motion_dense_mode
 
-        motion_flow_01 = self._smooth_motion_flow(flow_01)
-        motion_flow_10 = self._smooth_motion_flow(flow_10)
-
-        # 1. 只用中间 tau 特征预测一套 Gaussian 参数
+        # ============================================================
+        # Branch A: F_tau -> color_tau / offset_tau -> mu_tau = grid + offset
+        # ============================================================
         feat_ps_tau, dense_tau = self._make_gaussian_features(
             feat_fused_tau, scale_h, scale_w,
-            tau=rel_tau_target,
-            dense_mode=dense_mode
+            tau=tau_t,                 # real temporal hyper-parameter
+            dense_mode=dense_mode,
         )
-        params_tau = self._predict_gaussian_params(
-            feat_ps_tau,
-            tau=rel_tau_target
+        if getattr(self, 'full_res_color', False) and getattr(self, 'full_res_color_trained', False):
+            # Inference-only ablation: predict color on the full-res F_tau so small
+            # moving objects are not averaged away by the PixelUnshuffle grid.
+            tau_map = tau_t.to(dtype=feat_fused_tau.dtype).view(bs, 1, 1, 1)
+            tau_map = tau_map.expand(-1, 1, feat_fused_tau.shape[2], feat_fused_tau.shape[3])
+            param_feat_full = torch.cat([feat_fused_tau, tau_map], dim=1)
+            color_map = self.conv_color_full(param_feat_full)          # [B, 3, H, W]
+            color_tau = torch.sigmoid(
+                color_map.permute(0, 2, 3, 1).reshape(bs, -1, 3) - 2.0
+            )
+            # offset still comes from the ps grid
+            params_tau = self._predict_color_offset(feat_ps_tau, tau_t)
+            ps_h, ps_w = params_tau['ps_h'], params_tau['ps_w']
+            offset_tau = params_tau['offset']
+            n_gaussians = ps_h * ps_w
+            # Resample full-res color (H*W) onto the ps grid (ps_h*ps_w).
+            color_grid = F.avg_pool2d(color_map, kernel_size=2, stride=2)   # [B, 3, ps_h, ps_w]
+            if color_grid.shape[-2:] != (ps_h, ps_w):
+                color_grid = F.interpolate(color_grid, size=(ps_h, ps_w), mode='bilinear', align_corners=False)
+            color_tau = torch.sigmoid(color_grid.permute(0, 2, 3, 1).reshape(bs, n_gaussians, 3) - 2.0)
+        else:
+            params_tau = self._predict_color_offset(feat_ps_tau, tau_t)
+            ps_h, ps_w = params_tau['ps_h'], params_tau['ps_w']
+            color_tau = params_tau['color']
+            offset_tau = params_tau['offset']
+            n_gaussians = params_tau['n_gaussians']
+
+        # mu_tau = grid + Delta mu_tau (AOW-adjusted offset)
+        # Optional flow-driven displacement (motion compensation): move Gaussian
+        # centers to the intermediate position via tau-scaled optical flow.
+        # Use forward-backward consistency to weight which endpoint's motion is
+        # more reliable in occluded regions (motion + occlusion direct transfer).
+        if getattr(self, 'flow_driven_xyz', False):
+            xyz_base = self._base_xyz(offset_tau, ps_h, ps_w, H, W)
+            # Displace from frame-0 and frame-N to time tau.
+            xyz_from_0 = self._apply_flow_motion(xyz_base, flow_01, tau_t, ps_h, ps_w)
+            xyz_from_N = self._apply_flow_motion(xyz_base, flow_10, 1.0 - tau_t, ps_h, ps_w)
+            # Forward-backward consistency confidence.
+            conf_0, conf_N = self._compute_fb_confidence(flow_01, flow_10)
+            conf0_grid = self._confidence_to_gaussian_grid(conf_0, ps_h, ps_w)
+            confN_grid = self._confidence_to_gaussian_grid(conf_N, ps_h, ps_w)
+            # Blend the two motion-compensated positions by confidence.
+            pos_den = (conf0_grid + confN_grid).clamp_min(1e-6)
+            pos_w0 = conf0_grid / pos_den
+            pos_wN = confN_grid / pos_den
+            xyz_tau = pos_w0 * xyz_from_0 + pos_wN * xyz_from_N
+            # Also record motion stats for debugging.
+            with torch.no_grad():
+                self._temporal_stats['fb_conf0_mean'] = conf_0.mean().item()
+                self._temporal_stats['fb_confN_mean'] = conf_N.mean().item()
+        else:
+            xyz_tau = self._base_xyz(offset_tau, ps_h, ps_w, H, W)
+
+        # ============================================================
+        # Branch B: endpoint covariance -> CRA -> Sigma_tau
+        # ============================================================
+        feat_ps_0, dense_0 = self._make_gaussian_features(
+            feat_fused_0, scale_h, scale_w, tau=None, dense_mode=dense_mode,
+        )
+        feat_ps_N, dense_N = self._make_gaussian_features(
+            feat_fused_N, scale_h, scale_w, tau=None, dense_mode=dense_mode,
+        )
+        cov_0, _ = self._predict_endpoint_covariance(feat_ps_0)
+        cov_N, _ = self._predict_endpoint_covariance(feat_ps_N)
+
+        cov_tau, cra_weights = self._cra_resample_covariance(cov_0, cov_N, tau_t)
+
+        # ============================================================
+        # Opacity (fixed at 1 for the paper-aligned path)
+        # ============================================================
+        opacity = torch.ones(
+            bs, params_tau['n_gaussians'], 1,
+            device=device, dtype=color_tau.dtype,
         )
 
-        ps_h, ps_w = params_tau['ps_h'], params_tau['ps_w']
-
-        # 2. 先得到 tau Gaussian 的基础坐标
-        xyz_base = self._base_xyz(
-            params_tau['offset'], ps_h, ps_w, H, W
-        )
-
-        # 3. 用双向 flow 生成两个 motion-aligned 坐标候选
-        xyz_from_0 = self._apply_flow_motion(
-            xyz_base, motion_flow_01, tau_t, ps_h, ps_w
-        )
-        xyz_from_N = self._apply_flow_motion(
-            xyz_base, motion_flow_10, one_minus_tau, ps_h, ps_w
-        )
-
-        # 4. 前后向一致性置信度
-        conf_0, conf_N, cons_0, cons_N = self._compute_fb_confidence(flow_01, flow_10)
-        conf0_grid = self._confidence_to_gaussian_grid(conf_0, ps_h, ps_w)
-        confN_grid = self._confidence_to_gaussian_grid(conf_N, ps_h, ps_w)
-
-        # 5. 根据置信度融合位置
-        pos_den = (conf0_grid + confN_grid).clamp_min(1e-6)
-        pos_w0 = conf0_grid / pos_den
-        pos_wN = confN_grid / pos_den
-
-        xyz = pos_w0 * xyz_from_0 + pos_wN * xyz_from_N
-
-        # 6. color / cov / offset 全部来自 tau 特征预测的一套参数
-        color = params_tau['color']
-        cov = params_tau['cov']
-
-        # 7. opacity 也只保留一套
-        opacity = pos_den.clamp(max=1.0).to(color.dtype)
-
+        # ============================================================
+        # Debug / monitoring stats
+        # ============================================================
         with torch.no_grad():
-            flow01_grid = self._flow_to_gaussian_grid(flow_01, ps_h, ps_w)
-            flow10_grid = self._flow_to_gaussian_grid(flow_10, ps_h, ps_w)
-
-            self._temporal_stats['motion_flow01_abs_mean'] = flow01_grid.abs().mean().item()
-            self._temporal_stats['motion_flow10_abs_mean'] = flow10_grid.abs().mean().item()
-            self._temporal_stats['motion_tau_mean'] = tau_t.mean().item()
-            self._temporal_stats['fb_conf0_mean'] = conf_0.mean().item()
-            self._temporal_stats['fb_conf1_mean'] = conf_N.mean().item()
-            self._temporal_stats['fb_cons0_mean'] = cons_0.mean().item()
-            self._temporal_stats['fb_cons1_mean'] = cons_N.mean().item()
-            self._temporal_stats['motion_pair_merge'] = 1.0
-            self._temporal_stats['motion_pair_distance_mean'] = torch.norm(
-                xyz_from_0 - xyz_from_N, dim=-1
-            ).mean().item()
+            self._temporal_stats['tau_mean'] = tau_t.mean().item()
+            self._temporal_stats['offset_abs_mean'] = offset_tau.abs().mean().item()
+            self._temporal_stats['offset_abs_max'] = offset_tau.abs().max().item()
+            if hasattr(self, 'current_w_map') and self.current_w_map is not None:
+                self._temporal_stats['aow_mean'] = self.current_w_map.mean().item()
+                self._temporal_stats['aow_max'] = self.current_w_map.max().item()
+            self._temporal_stats['cov0_mean'] = cov_0.mean().item()
+            self._temporal_stats['covN_mean'] = cov_N.mean().item()
+            self._temporal_stats['cov_tau_mean'] = cov_tau.mean().item()
+            self._temporal_stats['cra_entropy'] = (
+                -cra_weights * torch.log(cra_weights.clamp_min(1e-8))
+            ).sum(dim=-1).mean().item()
 
         return self._render_gaussian_params(
-            color, cov, xyz, opacity,
-            scale_h, scale_w, H, W, dense_tau, debug_tag='motion'
+            color_tau, cov_tau, xyz_tau, opacity,
+            scale_h, scale_w, H, W,
+            dense_tau or dense_0 or dense_N, debug_tag='motion',
         )
-        # colors = [params0['color'], paramsN['color']]
-        # covs = [params0['cov'], paramsN['cov']]
-        # xyzs = [xyz0, xyzN]
-        # opacities = [opacity0, opacityN]
-        # dense_tau = False
-
-        # if feat_fused_tau is not None and self.tau_gaussian_opacity > 0:
-        #     feat_ps_tau, dense_tau = self._make_gaussian_features(
-        #         feat_fused_tau, scale_h, scale_w, tau=rel_tau_target, dense_mode=dense_mode
-        #     )
-        #     params_tau = self._predict_gaussian_params(feat_ps_tau, tau=rel_tau_target)
-        #     xyz_tau = self._base_xyz(params_tau['offset'], params_tau['ps_h'], params_tau['ps_w'], H, W)
-        #     midness = (1.0 - (2.0 * tau_t - 1.0).abs()).clamp(0.0, 1.0)
-        #     opacity_tau = (
-        #         self.tau_gaussian_opacity
-        #         * midness.view(bs, 1, 1)
-        #         * torch.ones(bs, params_tau['n_gaussians'], 1, device=device, dtype=params_tau['color'].dtype)
-        #     )
-        #     colors.append(params_tau['color'])
-        #     covs.append(params_tau['cov'])
-        #     xyzs.append(xyz_tau)
-        #     opacities.append(opacity_tau)
-
-        # color = torch.cat(colors, dim=1)
-        # cov = torch.cat(covs, dim=1)
-        # xyz = torch.cat(xyzs, dim=1)
-        # opacity = torch.cat(opacities, dim=1).to(color.dtype)
-
-        # with torch.no_grad():
-        #     flow01_grid = self._flow_to_gaussian_grid(flow_01, ps_h, ps_w)
-        #     flow10_grid = self._flow_to_gaussian_grid(flow_10, ps_h, ps_w)
-        #     self._temporal_stats['motion_flow01_abs_mean'] = flow01_grid.abs().mean().item()
-        #     self._temporal_stats['motion_flow10_abs_mean'] = flow10_grid.abs().mean().item()
-        #     self._temporal_stats['motion_tau_mean'] = tau_t.mean().item()
-        #     self._temporal_stats['motion_rel_tau0_mean'] = rel_tau_0.mean().item()
-        #     self._temporal_stats['motion_rel_tauN_mean'] = rel_tau_N.mean().item()
-        #     self._temporal_stats['fb_conf0_mean'] = conf_0.mean().item()
-        #     self._temporal_stats['fb_conf1_mean'] = conf_N.mean().item()
-        #     self._temporal_stats['fb_cons0_mean'] = cons_0.mean().item()
-        #     self._temporal_stats['fb_cons1_mean'] = cons_N.mean().item()
-        #     self._temporal_stats['tau_gaussian_opacity_mean'] = (
-        #         opacities[2].mean().item() if len(opacities) > 2 else 0.0
-        #     )
-
-        # return self._render_gaussian_params(
-        #     color, cov, xyz, opacity,
-        #     scale_h, scale_w, H, W, dense0 or denseN or dense_tau, debug_tag='motion'
-        # )
 
     def forward(self, vis_0, ir_0, vis_N, ir_N, scale, tau):
         """
@@ -731,81 +884,104 @@ class GaussianFusion(nn.Module):
         # --- Step 2: Encode both modalities at both time steps ---
         feat_vis_0, feat_ir_0 = self.encode(vis_0, ir_0)
         feat_vis_N, feat_ir_N = self.encode(vis_N, ir_N)
-        # =======================================================
-        # NEW 运动感知自适应窗口预测 (Motion-Aware Adaptive Window)
-        # =======================================================
-        # 利用 SIREN 网络和可见光端点特征，一次性计算出全局共享的 W_map
-        if hasattr(self, 'window_scorer'):
-            v_map = self.window_scorer(feat_vis_0, feat_vis_N) # [B, 10, H, W]
-            # 加权求和得到具体的像素级最大偏移范围
-            w_map = torch.sum(v_map * self.window_bank, dim=1, keepdim=True) # [B, 1, H, W]
-            self.current_w_map = w_map # 存入实例，供 _predict_gaussian_params 缩放 offset 使用
+
         # --- Step 3: Adapt flow to feature resolution ---
         # Features are same resolution as input (encoder preserves spatial dims)
-        # If feature resolution differs from flow resolution, resize flow
         if feat_vis_0.shape[2:] != flow_01.shape[2:]:
             fh, fw = feat_vis_0.shape[2], feat_vis_0.shape[3]
             scale_x = fw / flow_01.shape[3]
             scale_y = fh / flow_01.shape[2]
-
             flow_01 = F.interpolate(flow_01, size=(fh, fw), mode='bilinear', align_corners=True)
             flow_01[:, 0] *= scale_x
             flow_01[:, 1] *= scale_y
-
             flow_10 = F.interpolate(flow_10, size=(fh, fw), mode='bilinear', align_corners=True)
             flow_10[:, 0] *= scale_x
             flow_10[:, 1] *= scale_y
 
-        # --- Step 4: Temporal cross-attention to time τ (learnable) ---
-        feat_vis_tau = self.temporal_attn(
-            feat_vis_0, feat_vis_N, flow_01, flow_10, tau, self.occ_threshold
+        # --- Step 4: Cross-modal fusion at the two anchor frames ---
+        feat_fused_0 = self.fusion(feat_vis_0, feat_ir_0)   # F_0
+        feat_fused_N = self.fusion(feat_vis_N, feat_ir_N)   # F_N
+
+        # --- Step 5: AOW (Motion-Aware Adaptive Offset Window) ---
+        # SIREN scores endpoint fused features, yielding a per-pixel window size
+        # map W_map. Later offset is scaled: dmu_tau = dmu_tilde ⊙ W_map.
+        if hasattr(self, 'window_scorer'):
+            v_map = self.window_scorer(feat_fused_0, feat_fused_N)  # [B, 10, H, W]
+            w_map = torch.sum(v_map * self.window_bank, dim=1, keepdim=True)  # [B, 1, H, W]
+            # Keep the raw SIREN window for the AOW regularizer (below). The
+            # regularizer should only push the *learned* window toward 1; the
+            # deterministic motion modulation (no_grad) must stay untouched.
+            self.current_w_map_raw = w_map
+
+            # ---- Motion-aware window modulation ----
+            # The tanh-limited offset alone moves a Gaussian at most ~2px, but a
+            # moving object may need 10-30px. Since the paper forbids driving xyz
+            # with flow directly, we enlarge the offset window where optical flow
+            # is large so the offset can span the true displacement.
+            with torch.no_grad():
+                flow_mag = torch.max(
+                    flow_01.norm(dim=1, keepdim=True),
+                    flow_10.norm(dim=1, keepdim=True),
+                )  # [B,1,H,W]
+                if flow_mag.shape[-2:] != w_map.shape[-2:]:
+                    flow_mag = F.interpolate(flow_mag, size=w_map.shape[-2:],
+                                             mode='bilinear', align_corners=False)
+                motion_factor = 1.0 + self.motion_window_gain * (
+                    flow_mag / self.motion_window_flow_ref
+                )
+                motion_factor = motion_factor.clamp(1.0, self.motion_window_max)
+                w_map = w_map * motion_factor
+            self.current_w_map = w_map
+
+        # --- Step 6: CGM on fused endpoint features -> F_tau ---
+        feat_fused_tau = self.temporal_attn(
+            feat_fused_0, feat_fused_N, flow_01, flow_10, tau, self.occ_threshold
         )
-        vis_reg_loss = self.temporal_attn.last_reg_loss
-        vis_stats = dict(getattr(self.temporal_attn, '_debug_stats', {}))
 
-        feat_ir_tau = self.temporal_attn(
-            feat_ir_0, feat_ir_N, flow_01, flow_10, tau, self.occ_threshold
-        )
-        ir_reg_loss = self.temporal_attn.last_reg_loss
-        ir_stats = dict(getattr(self.temporal_attn, '_debug_stats', {}))
-
-        # Auxiliary modality reconstruction at intermediate time τ. These are
-        # supervised during training and ignored by the final inference output.
-        aux_vis_tau = self.aux_vis_decoder(feat_vis_tau)
-        aux_ir_tau = self.aux_ir_decoder(feat_ir_tau)
-        self._aux_outputs = {
-            'vis_tau': aux_vis_tau,
-            'ir_tau': aux_ir_tau,
-        }
-
-        if vis_reg_loss is not None and ir_reg_loss is not None:
-            self._temporal_reg_loss = 0.5 * (vis_reg_loss + ir_reg_loss)
-        else:
-            self._temporal_reg_loss = None
+        self._temporal_reg_loss = None
         self._temporal_stats = {}
-        for k, v in vis_stats.items():
-            self._temporal_stats[f'temporal_vis_{k}'] = v
-        for k, v in ir_stats.items():
-            self._temporal_stats[f'temporal_ir_{k}'] = v
-        with torch.no_grad():
-            self._temporal_stats['aux_vis_mean'] = aux_vis_tau.mean().item()
-            self._temporal_stats['aux_ir_mean'] = aux_ir_tau.mean().item()
+        cgm_stats = dict(getattr(self.temporal_attn, '_debug_stats', {}))
+        for k, v in cgm_stats.items():
+            self._temporal_stats[f'temporal_{k}'] = v
+        self._aux_outputs = {}
 
-        # --- Step 5/6: Cross-modal fusion and Gaussian rendering ---
+        # --- Step 6b: Auxiliary reconstruction of intermediate-time modalities ---
+        # Reconstruct Vi_tau and IR_tau from the fused F_tau feature. Supervision
+        # against the real intermediate frames (vis_gt / ir_gt) forces F_tau to
+        # keep BOTH modalities' content, preventing modal fade-out in the fusion.
+        #
+        # Motion-weighted supervision: the reconstruction loss is weighted per
+        # pixel by the optical-flow magnitude (normalized). Background regions
+        # (tiny flow) barely change and contribute little, so the model focuses
+        # on reconstructing the actually-moving regions where temporal fusion
+        # matters most.
+        if self.training or getattr(self, 'compute_aux', True):
+            aux_vis = self.aux_vis_decoder(feat_fused_tau)
+            aux_ir = self.aux_ir_decoder(feat_fused_tau)
+            self._aux_outputs['vis_tau'] = aux_vis
+            self._aux_outputs['ir_tau'] = aux_ir
+            # Per-pixel motion weight in [0,1]: normalized average of the two
+            # bidirectional flows, upsampled to the aux output resolution.
+            with torch.no_grad():
+                f_01 = F.interpolate(flow_01, size=feat_fused_tau.shape[-2:],
+                                     mode='bilinear', align_corners=True)
+                f_10 = F.interpolate(flow_10, size=feat_fused_tau.shape[-2:],
+                                     mode='bilinear', align_corners=True)
+                mag = (0.5 * (f_01.norm(dim=1, keepdim=True)
+                              + f_10.norm(dim=1, keepdim=True)))  # [B,1,H,W]
+                w = mag / (mag.flatten(1).max(dim=1).values.view(-1, 1, 1, 1) + 1e-6)
+                self._aux_outputs['motion_weight'] = w.clamp(0, 1)
+
+        # --- Step 7: Gaussian rendering ---
         if self.gaussian_render_mode == 'motion':
-            # Fuse each endpoint first, then move endpoint Gaussians along flow.
-            feat_fused_0 = self.fusion(feat_vis_0, feat_ir_0)
-            feat_fused_N = self.fusion(feat_vis_N, feat_ir_N)
-            feat_fused_tau = self.fusion(feat_vis_tau, feat_ir_tau)
             output = self._render_motion_gaussians(
                 feat_fused_0, feat_fused_N, flow_01, flow_10,
                 scale_h, scale_w, lr_h, lr_w, tau=tau,
                 feat_fused_tau=feat_fused_tau
             )
         else:
-            # Backward-compatible path: interpolate features, fuse, then render.
-            feat_fused = self.fusion(feat_vis_tau, feat_ir_tau)  # [B, 64, H, W]
-            output = self._render_gaussians(feat_fused, scale_h, scale_w, lr_h, lr_w, tau=tau)
+            # Backward-compatible path: render directly from the CGM feature.
+            output = self._render_gaussians(feat_fused_tau, scale_h, scale_w, lr_h, lr_w, tau=tau)
         if hasattr(self, '_debug_stats'):
             self._debug_stats.update(self._temporal_stats)
 
@@ -815,6 +991,19 @@ class GaussianFusion(nn.Module):
         """Return the latest differentiable temporal anti-collapse loss."""
         return self._temporal_reg_loss
 
+    def get_aow_regularization(self):
+        """
+        Mild regularizer pushing the AOW window map towards 1.0, preventing the
+        SIREN window scorer from collapsing onto the maximum window (which would
+        make offsets reach ±10 px immediately).
+        """
+        # Regularize the *raw learned* window only; the motion modulation is
+        # deterministic and must not be pulled back toward 1 by the loss.
+        w_map = getattr(self, 'current_w_map_raw', None)
+        if w_map is None:
+            return None
+        return (w_map - 1.0).abs().mean()
+
     def get_aux_outputs(self):
-        """Return latest auxiliary visible/infrared reconstructions."""
+        """Return latest auxiliary visible/infrared reconstructions (removed)."""
         return self._aux_outputs

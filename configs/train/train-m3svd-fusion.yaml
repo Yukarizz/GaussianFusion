@@ -1,5 +1,6 @@
 # GaussianFusion Training Configuration
-# Multi-modal temporal fusion with 2D Gaussian splatting
+# Paper-aligned multi-modal temporal fusion with 2D Gaussian splatting
+# (compressed for a single RTX 5090, ~32GB VRAM)
 
 seed: 42
 
@@ -10,26 +11,27 @@ model:
     encoder_spec:
       name: edsr-baseline
       args:
-        n_resblocks: 16
-        n_feats: 64
+        n_resblocks: 8          # 16 -> 8  (compression)
+        n_feats: 48             # 64 -> 48 (compression)
         res_scale: 1
         scale: [1]
         no_upsampling: true
-        n_colors: 64
+        n_colors: 48
         rgb_range: 1
         pretrained_path: null
+    flow_model: searaft           # 光流模型: spynet | searaft (RAFT, 更强)
+    searaft_pretrained: /root/autodl-tmp/GaussianFusion/models/weights/Tartan-C-T-TSKH-spring540x960-S.pth
     spynet_pretrained: sintel-final
-    n_feats: 64
+    n_feats: 48                 # 64 -> 48 (compression)
     freeze_spynet: true
     occ_threshold: 5.0
     gaussian_render_mode: motion
-    fb_confidence_scale: 5.0
-    fb_confidence_floor: 0.2
     motion_force_dense: false
     motion_dense_mode: none
-    motion_flow_smooth_kernel: 3
-    motion_pair_merge: true
-    tau_gaussian_opacity: 0.0
+    full_res_color: false       # 全分辨率颜色预测（实验表明非关键；关闭以保持论文对齐 + 兼容已有 checkpoint）
+    flow_driven_xyz: false      # 论文规定：flow 只用于构造 F_tau，不再驱动 xyz（double motion compensation）
+    occ_fusion: true            # CGM 用前后向一致性遮挡融合替代坍缩的学习 mask（消除双影）
+    occ_gamma: 4.0              # 遮挡 mask 陡峭度（越大越接近硬选择）
 
 # Training dataset
 train_dataset:
@@ -39,26 +41,28 @@ train_dataset:
     split: train
     vis_modality: visible_Enhance
     ir_modality: infrared_Enhance
-    n_min: 8
-    n_max: 8
+    n_min: 2                   # 相邻帧插帧 (gap=1: 帧 i 与 i+2, GT 为 i+1, tau=0.5)
+    n_max: 4
     scale_min: 1.0
     scale_max: 1.0
-    patch_size: 256
+    patch_size: 224            # 256 -> 224 (compression)
     augment: true
 
 # Training hyperparameters
-batch_size: 16
+batch_size: 24                  # 16 -> 8 (compression for 32GB VRAM)
 num_workers: 8
-epochs: 10
-warmup_epochs: 1
+epochs: 30
+warmup_epochs: 2
 lr: 1.0e-4
 weight_decay: 0
+use_amp: true
 save_every: 1
 val_every: 1
 # Loss weights
 lambda_int: 1.0
 lambda_color: 1.0
 lambda_grad: 2.0
-lambda_temporal: 0.1
-lambda_aux_vis: 0.5
-lambda_aux_ir: 0.5
+lambda_temporal: 0.0           # CGM 不再产生对抗坍缩正则
+lambda_aux_vis: 1.0            # F_tau -> Vi_tau 重建损失（保留可见光中间内容）
+lambda_aux_ir: 1.0             # F_tau -> IR_tau 重建损失（保留红外热源中间内容）
+lambda_aow: 0.01               # AOW 窗口正则：抑制 SIREN 坍缩到最大窗口

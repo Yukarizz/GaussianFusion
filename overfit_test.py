@@ -32,20 +32,20 @@ def main():
     os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
     device = torch.device('cuda')
 
-    # Build model
+    # Build model (compressed config matching configs/train/train-m3svd-fusion.yaml)
     model = models.make({
         'name': 'gaussian-fusion',
         'args': {
             'encoder_spec': {
                 'name': 'edsr-baseline',
                 'args': {
-                    'n_resblocks': 16, 'n_feats': 64, 'res_scale': 1,
+                    'n_resblocks': 8, 'n_feats': 48, 'res_scale': 1,
                     'scale': [1], 'no_upsampling': True,
-                    'n_colors': 64, 'rgb_range': 1, 'pretrained_path': None,
+                    'n_colors': 48, 'rgb_range': 1, 'pretrained_path': None,
                 }
             },
             'spynet_pretrained': 'sintel-final',
-            'n_feats': 64,
+            'n_feats': 48,
             'freeze_spynet': True,
         }
     }).to(device)
