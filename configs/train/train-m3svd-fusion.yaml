@@ -32,6 +32,10 @@ model:
     flow_driven_xyz: false      # 论文规定：flow 只用于构造 F_tau，不再驱动 xyz（double motion compensation）
     occ_fusion: true            # CGM 用前后向一致性遮挡融合替代坍缩的学习 mask（消除双影）
     occ_gamma: 4.0              # 遮挡 mask 陡峭度（越大越接近硬选择）
+    occ_gamma_flow_ref: 10.0    # 自适应 gamma 的光流幅值参考（大位移下软化遮挡惩罚）
+    motion_window_gain: 4.0     # 光流幅值 -> offset 窗口放大的增益
+    motion_window_max: 18.0     # offset 窗口放大上限（大位移需要更大窗口）
+    motion_window_flow_ref: 20.0  # 达到该光流幅值时窗口放大 gain 倍
 
 # Training dataset
 train_dataset:
@@ -42,7 +46,7 @@ train_dataset:
     vis_modality: visible_Enhance
     ir_modality: infrared_Enhance
     n_min: 2                   # 相邻帧插帧 (gap=1: 帧 i 与 i+2, GT 为 i+1, tau=0.5)
-    n_max: 4
+    n_max: 12
     scale_min: 1.0
     scale_max: 1.0
     patch_size: 224            # 256 -> 224 (compression)

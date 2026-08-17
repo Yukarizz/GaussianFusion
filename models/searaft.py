@@ -35,7 +35,7 @@ def _default_args():
     args.radius = 4
     args.dim = 128
     args.num_blocks = 2
-    args.iters = 4
+    args.iters = 12
     args.image_size = [540, 960]
     args.scale = -1
     args.epsilon = 1e-8

@@ -55,7 +55,7 @@ class TemporalCrossAttention(nn.Module):
     """
 
     def __init__(self, n_feats=64, tau_dim=64, n_heads=4, use_occlusion_fusion=False,
-                 occ_gamma=1.0):
+                 occ_gamma=1.0, occ_gamma_flow_ref=10.0):
         super().__init__()
         self.n_feats = n_feats
         self.last_reg_loss = None
@@ -65,6 +65,10 @@ class TemporalCrossAttention(nn.Module):
         # the "two half-transparent objects" ghosting at intermediate times.
         self.use_occlusion_fusion = use_occlusion_fusion
         self.occ_gamma = occ_gamma  # steepness of the occlusion soft mask
+        # Flow-magnitude reference for adaptive gamma. A fixed gamma over-penalizes
+        # large-displacement motion (fb_err grows with flow magnitude), making the
+        # mask collapse onto a single endpoint even when both warps are valid.
+        self.occ_gamma_flow_ref = occ_gamma_flow_ref
 
         # Warped endpoint features (2*C) + tau map (1) -> mask (1) + residual (C)
         self.fusion_head = nn.Sequential(
@@ -131,7 +135,14 @@ class TemporalCrossAttention(nn.Module):
             flow_10_at_0 = flow_warp(flow_10, flow_0t)       # bwd flow resampled to tau
             fb_err = (flow_01 + flow_10_at_0).norm(dim=1, keepdim=True)  # [B,1,H,W]
             # confidence of endpoint-0 content at this tau position
-            c0 = torch.exp(-self.occ_gamma * fb_err).clamp(0, 1)   # high where consistent
+            # Adaptive gamma: normalize fb_err by the local flow magnitude so the
+            # confidence does not over-penalize large (but consistent) motion.
+            with torch.no_grad():
+                flow_ref = (flow_01.norm(dim=1, keepdim=True)
+                            + flow_10.norm(dim=1, keepdim=True)).clamp_min(1e-6) * 0.5
+                gamma = self.occ_gamma * self.occ_gamma_flow_ref / (
+                    self.occ_gamma_flow_ref + flow_ref)
+            c0 = torch.exp(-gamma * fb_err).clamp(0, 1)   # high where consistent
             c1 = 1.0 - c0
             denom = c0 + c1 + 1e-8
             w0 = c0 / denom

@@ -131,6 +131,7 @@ class GaussianFusion(nn.Module):
                  flow_driven_xyz=False,
                  occ_fusion=False,
                  occ_gamma=1.0,
+                 occ_gamma_flow_ref=10.0,
                  motion_window_gain=4.0,
                  motion_window_max=10.0,
                  motion_window_flow_ref=20.0):
@@ -138,6 +139,7 @@ class GaussianFusion(nn.Module):
         self.flow_model = flow_model
         self.occ_fusion_enabled = occ_fusion
         self.occ_gamma = occ_gamma
+        self.occ_gamma_flow_ref = occ_gamma_flow_ref
         # Motion-aware window modulation: enlarge the AOW offset window where the
         # optical flow magnitude is large, so the tanh-limited offset can cover the
         # true object displacement (the paper forbids driving xyz with flow directly).
@@ -207,7 +209,8 @@ class GaussianFusion(nn.Module):
             'name': 'temporal-cross-attention',
             'args': {'n_feats': n_feats, 'tau_dim': 64,
                      'use_occlusion_fusion': self.occ_fusion_enabled,
-                     'occ_gamma': self.occ_gamma}
+                     'occ_gamma': self.occ_gamma,
+                     'occ_gamma_flow_ref': occ_gamma_flow_ref}
         })
 
         # --- Cross-modal fusion ---
