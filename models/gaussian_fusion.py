@@ -17,7 +17,7 @@ from models.temporal_attention import SinusoidalPosEmb
 from warp_utils import flow_warp
 
 from gsplat.project_gaussians_2d import project_gaussians_2d
-from gsplat.rasterize_sum import rasterize_gaussians_sum
+from gsplat.rasterize import rasterize_gaussians
 
 class Sine(nn.Module):
     """SIREN 核心激活函数"""
@@ -267,15 +267,19 @@ class GaussianFusion(nn.Module):
             nn.Conv2d(self.gau_feats // 2, 2, kernel_size=1),
         )
 
-        # Full-resolution color head (inference-only switch full_res_color=True).
-        # Operates on F_tau at full res (before PixelUnshuffle) to preserve small
-        # moving-object details that the coarse ps grid averages away.
+        # Full-resolution color head. Operates on F_tau at full res (before
+        # PixelUnshuffle) to preserve small moving-object details that the coarse
+        # ps grid averages away. Matches the aux decoders' structure (full-res
+        # 3x3 convs), so it can reach the same sharpness as aux_vis. Trained
+        # end-to-end from scratch in the main loop.
         self.conv_color_full = nn.Sequential(
             nn.Conv2d(n_feats + 1, n_feats, kernel_size=3, padding=1),
             nn.LeakyReLU(0.1, inplace=True),
-            nn.Conv2d(n_feats, n_feats // 2, kernel_size=3, padding=1),
+            nn.Conv2d(n_feats, n_feats, kernel_size=3, padding=1),
             nn.LeakyReLU(0.1, inplace=True),
-            nn.Conv2d(n_feats // 2, 3, kernel_size=1),
+            nn.Conv2d(n_feats, n_feats, kernel_size=3, padding=1),
+            nn.LeakyReLU(0.1, inplace=True),
+            nn.Conv2d(n_feats, 3, kernel_size=3, padding=1),
         )
 
         # --- τ conditioning for Gaussian head (FiLM modulation) ---
@@ -629,35 +633,33 @@ class GaussianFusion(nn.Module):
             # for the enlarged canvas and can leave periodic uncovered pixels.
             min_std_w = max(0.5, 0.5 * scale_w) if dense_sr_render else 0.85
             min_std_h = max(0.5, 0.5 * scale_h) if dense_sr_render else 1.0
-            L11 = cov_i[:, 0] * scale_w / 2.0 + min_std_w
-            L21 = cov_i[:, 1] * scale_h / 2.0
-            L22 = cov_i[:, 2] * scale_h / 2.0 + min_std_h
+            # Inference-only footprint scale (default 1.0 = off). <1 shrinks each
+            # Gaussian's footprint to reduce over-blending between adjacent
+            # Gaussians; >1 enlarges. For experiments only.
+            fp_scale = float(getattr(self, 'footprint_scale', 1.0))
+            L11 = (cov_i[:, 0] * scale_w / 2.0 + min_std_w) * fp_scale
+            L21 = cov_i[:, 1] * scale_h / 2.0 * fp_scale
+            L22 = (cov_i[:, 2] * scale_h / 2.0 + min_std_h) * fp_scale
             weighted_cholesky = torch.stack([L11, L21, L22], dim=1)
 
             # Project and rasterize
             xys, depths, radii, conics, num_tiles_hit = project_gaussians_2d(
                 xyz, weighted_cholesky, H, W, tile_bounds
             )
-            # Rasterize color (numerator)
-            out_rgb = rasterize_gaussians_sum(
+            # Standard alpha-composited rasterization. (The fork's
+            # rasterize_gaussians_sum has a tile-boundary defect: every 16-row
+            # tile's bottom rows get zero coverage in dense (1 Gaussian/pixel)
+            # mode, producing periodic horizontal black lines. The standard
+            # alpha-blended rasterizer has no such artifact.)
+            out_img, out_alpha = rasterize_gaussians(
                 xys, depths, radii, conics, num_tiles_hit,
                 color_i, opacity, H, W,
                 self.BLOCK_H, self.BLOCK_W,
-                background=background, return_alpha=False
+                background=background, return_alpha=True
             )
-            # Rasterize weights (denominator) for normalization
-            ones_color = torch.ones_like(color_i)
-            out_w = rasterize_gaussians_sum(
-                xys, depths, radii, conics, num_tiles_hit,
-                ones_color, opacity, H, W,
-                self.BLOCK_H, self.BLOCK_W,
-                background=background, return_alpha=False
-            )
-            # Normalized output. Motion-shifted Gaussians can leave thin
-            # low-coverage rows; avoid turning those rows into hard black lines.
-            out_img = out_rgb / out_w.clamp(min=1e-6)
+            # out_img: [H, W, 3]; alpha: [H, W] in [0,1]
             out_img = out_img.permute(2, 0, 1).unsqueeze(0)  # [1, 3, H, W]
-            coverage = out_w[..., :1].permute(2, 0, 1).unsqueeze(0).clamp(0.0, 1.0)
+            coverage = out_alpha.unsqueeze(0).unsqueeze(0).clamp(0.0, 1.0)  # [1,1,H,W]
             low_coverage = coverage < 0.25
             if low_coverage.any():
                 pooled_num = F.avg_pool2d(out_img * coverage, kernel_size=5, stride=1, padding=2)
@@ -748,25 +750,28 @@ class GaussianFusion(nn.Module):
             dense_mode=dense_mode,
         )
         if getattr(self, 'full_res_color', False) and getattr(self, 'full_res_color_trained', False):
-            # Inference-only ablation: predict color on the full-res F_tau so small
-            # moving objects are not averaged away by the PixelUnshuffle grid.
+            # Predict color on the full-res F_tau so small moving objects are not
+            # averaged away by the PixelUnshuffle grid. Strong full-res head
+            # (aux-decoder-like) trained end-to-end in the main loop.
             tau_map = tau_t.to(dtype=feat_fused_tau.dtype).view(bs, 1, 1, 1)
             tau_map = tau_map.expand(-1, 1, feat_fused_tau.shape[2], feat_fused_tau.shape[3])
             param_feat_full = torch.cat([feat_fused_tau, tau_map], dim=1)
-            color_map = self.conv_color_full(param_feat_full)          # [B, 3, H, W]
-            color_tau = torch.sigmoid(
-                color_map.permute(0, 2, 3, 1).reshape(bs, -1, 3) - 2.0
-            )
+            color_tau_full = torch.sigmoid(self.conv_color_full(param_feat_full) - 2.0)
             # offset still comes from the ps grid
             params_tau = self._predict_color_offset(feat_ps_tau, tau_t)
             ps_h, ps_w = params_tau['ps_h'], params_tau['ps_w']
             offset_tau = params_tau['offset']
             n_gaussians = ps_h * ps_w
-            # Resample full-res color (H*W) onto the ps grid (ps_h*ps_w).
-            color_grid = F.avg_pool2d(color_map, kernel_size=2, stride=2)   # [B, 3, ps_h, ps_w]
-            if color_grid.shape[-2:] != (ps_h, ps_w):
-                color_grid = F.interpolate(color_grid, size=(ps_h, ps_w), mode='bilinear', align_corners=False)
-            color_tau = torch.sigmoid(color_grid.permute(0, 2, 3, 1).reshape(bs, n_gaussians, 3) - 2.0)
+            # Resample full-res color (H*W) onto the Gaussian grid (ps_h*ps_w).
+            # In dense mode the ps grid is already full-res (H*W), so no pooling
+            # is needed; only the half-res (PixelUnshuffle) grid needs pooling.
+            if (ps_h, ps_w) != color_tau_full.shape[-2:]:
+                color_grid = F.avg_pool2d(color_tau_full, kernel_size=2, stride=2)  # [B, 3, ps_h, ps_w]
+                if color_grid.shape[-2:] != (ps_h, ps_w):
+                    color_grid = F.interpolate(color_grid, size=(ps_h, ps_w), mode='bilinear', align_corners=False)
+            else:
+                color_grid = color_tau_full
+            color_tau = color_grid.permute(0, 2, 3, 1).reshape(bs, n_gaussians, 3)
         else:
             params_tau = self._predict_color_offset(feat_ps_tau, tau_t)
             ps_h, ps_w = params_tau['ps_h'], params_tau['ps_w']
@@ -948,6 +953,12 @@ class GaussianFusion(nn.Module):
             self._temporal_stats[f'temporal_{k}'] = v
         self._aux_outputs = {}
 
+        # Per-sample tau tensor for aux/color-head conditioning.
+        tau_t = self._expand_tau(tau, vis_0.shape[0], vis_0.device)
+        if tau_t is None:
+            tau_t = vis_0.new_zeros(vis_0.shape[0])
+        bs = vis_0.shape[0]
+
         # --- Step 6b: Auxiliary reconstruction of intermediate-time modalities ---
         # Reconstruct Vi_tau and IR_tau from the fused F_tau feature. Supervision
         # against the real intermediate frames (vis_gt / ir_gt) forces F_tau to
@@ -963,6 +974,15 @@ class GaussianFusion(nn.Module):
             aux_ir = self.aux_ir_decoder(feat_fused_tau)
             self._aux_outputs['vis_tau'] = aux_vis
             self._aux_outputs['ir_tau'] = aux_ir
+            # If the full-res color head is active, also expose its raw color
+            # map so the training loop can supervise it directly (accelerates
+            # convergence of the color head toward aux-level sharpness).
+            if getattr(self, 'full_res_color', False) and getattr(self, 'full_res_color_trained', False):
+                tau_map = tau_t.to(dtype=feat_fused_tau.dtype).view(bs, 1, 1, 1)
+                tau_map = tau_map.expand(-1, 1, feat_fused_tau.shape[2], feat_fused_tau.shape[3])
+                self._aux_outputs['full_color_vis'] = torch.sigmoid(
+                    self.conv_color_full(torch.cat([feat_fused_tau, tau_map], dim=1)) - 2.0
+                )
             # Per-pixel motion weight in [0,1]: normalized average of the two
             # bidirectional flows, upsampled to the aux output resolution.
             with torch.no_grad():

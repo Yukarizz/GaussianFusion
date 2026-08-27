@@ -26,16 +26,15 @@ model:
     freeze_spynet: true
     occ_threshold: 5.0
     gaussian_render_mode: motion
-    motion_force_dense: false
-    motion_dense_mode: none
-    full_res_color: false       # 全分辨率颜色预测（实验表明非关键；关闭以保持论文对齐 + 兼容已有 checkpoint）
+    motion_force_dense: true    # 全分辨率高斯网格：每像素一个高斯核（307200@224x224）
+                                # 关键修复：offset/cov/color 都在全分辨率预测，运动物体位置精度达像素级
+                                # （半分辨率 ps 网格时每 2x2 像素共享一个高斯，运动物体细节被网格平均掉）
+    motion_dense_mode: full
+    full_res_color: true       # 全分辨率颜色预测：与 aux 解码器同结构，避免 ps 粗网格模糊
+                               # 关键修复：conv_color_full 现在在主训练循环中联合训练（此前仅单独微调导致近随机权重）
     flow_driven_xyz: false      # 论文规定：flow 只用于构造 F_tau，不再驱动 xyz（double motion compensation）
     occ_fusion: true            # CGM 用前后向一致性遮挡融合替代坍缩的学习 mask（消除双影）
     occ_gamma: 4.0              # 遮挡 mask 陡峭度（越大越接近硬选择）
-    occ_gamma_flow_ref: 10.0    # 自适应 gamma 的光流幅值参考（大位移下软化遮挡惩罚）
-    motion_window_gain: 4.0     # 光流幅值 -> offset 窗口放大的增益
-    motion_window_max: 18.0     # offset 窗口放大上限（大位移需要更大窗口）
-    motion_window_flow_ref: 20.0  # 达到该光流幅值时窗口放大 gain 倍
 
 # Training dataset
 train_dataset:
@@ -46,14 +45,14 @@ train_dataset:
     vis_modality: visible_Enhance
     ir_modality: infrared_Enhance
     n_min: 2                   # 相邻帧插帧 (gap=1: 帧 i 与 i+2, GT 为 i+1, tau=0.5)
-    n_max: 12
+    n_max: 8
     scale_min: 1.0
     scale_max: 1.0
     patch_size: 224            # 256 -> 224 (compression)
     augment: true
 
 # Training hyperparameters
-batch_size: 24                  # 16 -> 8 (compression for 32GB VRAM)
+batch_size: 12                   # 24 -> 8 (dense 全分辨率高斯网格显存大，batch=8 用 ~15GB，留足余量)
 num_workers: 8
 epochs: 30
 warmup_epochs: 2
@@ -69,4 +68,5 @@ lambda_grad: 2.0
 lambda_temporal: 0.0           # CGM 不再产生对抗坍缩正则
 lambda_aux_vis: 1.0            # F_tau -> Vi_tau 重建损失（保留可见光中间内容）
 lambda_aux_ir: 1.0             # F_tau -> IR_tau 重建损失（保留红外热源中间内容）
+lambda_full_color: 1.0         # 全分辨率颜色头直接监督（F_tau -> 清晰 Vis_tau）
 lambda_aow: 0.01               # AOW 窗口正则：抑制 SIREN 坍缩到最大窗口

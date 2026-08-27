@@ -98,7 +98,7 @@ class FusionLoss(nn.Module):
 
     def __init__(self, lambda_int=1.0, lambda_color=1.0, lambda_grad=5.0,
                  lambda_temporal=0.0, lambda_aux_vis=0.0, lambda_aux_ir=0.0,
-                 lambda_aow=0.0, channels=3):
+                 lambda_aow=0.0, lambda_full_color=0.0, channels=3):
         super().__init__()
         self.lambda_int = lambda_int
         self.lambda_color = lambda_color  # 色彩损失权重
@@ -107,6 +107,7 @@ class FusionLoss(nn.Module):
         self.lambda_aux_vis = lambda_aux_vis
         self.lambda_aux_ir = lambda_aux_ir
         self.lambda_aow = lambda_aow      # AOW 窗口正则（抑制 SIREN 坍缩到最大窗口）
+        self.lambda_full_color = lambda_full_color  # 全分辨率颜色头直接监督
         
         self.l1 = nn.L1Loss()
         self.grad_operator = GradientLoss(channels=channels)
@@ -176,10 +177,12 @@ class FusionLoss(nn.Module):
 
         loss_aux_vis = fused.new_tensor(0.0)
         loss_aux_ir = fused.new_tensor(0.0)
+        loss_full_color = fused.new_tensor(0.0)
         if aux_outputs:
             aux_vis = aux_outputs.get('vis_tau')
             aux_ir = aux_outputs.get('ir_tau')
             mw = aux_outputs.get('motion_weight')
+            full_color = aux_outputs.get('full_color_vis')
             if aux_vis is not None:
                 vis_aux_gt = vis_gt
                 if aux_vis.shape[-2:] != vis_gt.shape[-2:]:
@@ -197,8 +200,18 @@ class FusionLoss(nn.Module):
                     loss_aux_ir = self._weighted_l1(aux_ir, ir_aux_gt, mw)
                 else:
                     loss_aux_ir = self.l1(aux_ir, ir_aux_gt)
+            # Direct supervision of the full-res color head: it must reconstruct
+            # the sharp intermediate visible frame (same target as aux_vis) so
+            # its color reaches aux-level sharpness instead of staying coarse.
+            if full_color is not None:
+                fc_gt = vis_gt
+                if full_color.shape[-2:] != vis_gt.shape[-2:]:
+                    fc_gt = F.interpolate(vis_gt, size=full_color.shape[-2:], mode='bilinear', align_corners=False)
+                loss_full_color = self._weighted_l1(full_color, fc_gt, mw) if (
+                    mw is not None and mw.shape[-2:] == full_color.shape[-2:]) else self.l1(full_color, fc_gt)
 
         total = total + self.lambda_aux_vis * loss_aux_vis + self.lambda_aux_ir * loss_aux_ir
+        total = total + self.lambda_full_color * loss_full_color
 
         loss_aow = fused.new_tensor(0.0)
         if aow_loss is not None:
@@ -212,6 +225,7 @@ class FusionLoss(nn.Module):
             'loss_temporal': temporal_loss.detach().item(),
             'loss_aux_vis': loss_aux_vis.detach().item(),
             'loss_aux_ir': loss_aux_ir.detach().item(),
+            'loss_full_color': loss_full_color.detach().item(),
             'loss_aow': loss_aow.detach().item(),
             'loss_total': total.item(),
         }
@@ -368,6 +382,7 @@ def train_epoch(model, loader, optimizer, criterion, device, epoch, global_step,
         'loss_aux_vis': Averager(),
         'loss_aux_ir': Averager(),
         'loss_aow': Averager(),
+        'loss_full_color': Averager(),
     }
 
     use_amp = scaler is not None
@@ -433,6 +448,7 @@ def train_epoch(model, loader, optimizer, criterion, device, epoch, global_step,
                 'train/loss_temporal': loss_dict['loss_temporal'],
                 'train/loss_aux_vis': loss_dict['loss_aux_vis'],
                 'train/loss_aux_ir': loss_dict['loss_aux_ir'],
+                'train/loss_full_color': loss_dict['loss_full_color'],
                 'train/loss_aow': loss_dict['loss_aow'],
                 'train/lr': optimizer.param_groups[0]['lr'],
             }
@@ -453,6 +469,7 @@ def train_epoch(model, loader, optimizer, criterion, device, epoch, global_step,
             temp=f'{loss_dict["loss_temporal"]:.4f}',
             aux_v=f'{loss_dict["loss_aux_vis"]:.4f}',
             aux_i=f'{loss_dict["loss_aux_ir"]:.4f}',
+            fc=f'{loss_dict["loss_full_color"]:.4f}',
             aow=f'{loss_dict["loss_aow"]:.4f}',
         )
 
@@ -466,6 +483,7 @@ def train_epoch(model, loader, optimizer, criterion, device, epoch, global_step,
             'epoch/loss_temporal': loss_components['loss_temporal'].item(),
             'epoch/loss_aux_vis': loss_components['loss_aux_vis'].item(),
             'epoch/loss_aux_ir': loss_components['loss_aux_ir'].item(),
+            'epoch/loss_full_color': loss_components['loss_full_color'].item(),
             'epoch/loss_aow': loss_components['loss_aow'].item(),
             'epoch/lr': optimizer.param_groups[0]['lr'],
         }
@@ -487,6 +505,7 @@ def validate(model, loader, criterion, device, global_step, log_images=False):
         'loss_aux_vis': Averager(),
         'loss_aux_ir': Averager(),
         'loss_aow': Averager(),
+        'loss_full_color': Averager(),
     }
     sample_logged = False
     diag_logged = False
@@ -544,6 +563,7 @@ def validate(model, loader, criterion, device, global_step, log_images=False):
         'val/loss_temporal': loss_components['loss_temporal'].item(),
         'val/loss_aux_vis': loss_components['loss_aux_vis'].item(),
         'val/loss_aux_ir': loss_components['loss_aux_ir'].item(),
+        'val/loss_full_color': loss_components['loss_full_color'].item(),
         'val/loss_aow': loss_components['loss_aow'].item(),
     }, step=global_step)
     return val_loss
@@ -636,6 +656,7 @@ def main():
         lambda_aux_vis=config.get('lambda_aux_vis', 0.0),
         lambda_aux_ir=config.get('lambda_aux_ir', 0.0),
         lambda_aow=config.get('lambda_aow', 0.0),
+        lambda_full_color=config.get('lambda_full_color', 0.0),
     )
     if is_main_process():
         log('Loss weights: '
@@ -645,7 +666,8 @@ def main():
             f'lambda_temporal={criterion.lambda_temporal}, '
             f'lambda_aux_vis={criterion.lambda_aux_vis}, '
             f'lambda_aux_ir={criterion.lambda_aux_ir}, '
-            f'lambda_aow={criterion.lambda_aow}')
+            f'lambda_aow={criterion.lambda_aow}, '
+            f'lambda_full_color={criterion.lambda_full_color}')
 
     # Resume
     start_epoch = 1
@@ -665,6 +687,17 @@ def main():
                     log(f'  Warning: optimizer state not loaded due to parameter mismatch: {e}')
         start_epoch = checkpoint['epoch'] + 1
         log(f'Resumed from epoch {start_epoch - 1}')
+
+    # Always train the full-res color head in the main loop so its weights stay
+    # in sync with the offset/covariance rendering path. Previously it was only
+    # ever fine-tuned in isolation, leaving it near-random for inference, which
+    # caused the coarse conv_color on the PixelUnshuffle grid to be the blur
+    # bottleneck (color PSNR ~17.7 vs aux_vis_decoder ~34.5 on the same F_tau).
+    if is_main_process():
+        raw_model = model.module if dist.is_initialized() else model
+        raw_model.full_res_color_trained = True
+        log(f'[train] full_res_color={getattr(raw_model, "full_res_color", False)}, '
+            f'full_res_color_trained=True (training the full-res color head)')
 
     # Training loop
     timer = Timer()
