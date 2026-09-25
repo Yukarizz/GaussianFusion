@@ -134,7 +134,9 @@ class GaussianFusion(nn.Module):
                  occ_gamma_flow_ref=10.0,
                  motion_window_gain=4.0,
                  motion_window_max=10.0,
-                 motion_window_flow_ref=20.0):
+                 motion_window_flow_ref=20.0,
+                 aow_penalty='motion_hinge',
+                 aow_window_cap=10.0):
         super().__init__()
         self.flow_model = flow_model
         self.occ_fusion_enabled = occ_fusion
@@ -146,6 +148,9 @@ class GaussianFusion(nn.Module):
         self.motion_window_gain = motion_window_gain
         self.motion_window_max = motion_window_max
         self.motion_window_flow_ref = motion_window_flow_ref
+        # AOW regularizer shape, see get_aow_regularization().
+        self.aow_penalty = aow_penalty
+        self.aow_window_cap = aow_window_cap
 
         self.n_feats = n_feats
         # Inference switch: predict color on the full-res F_tau instead of the
@@ -929,6 +934,12 @@ class GaussianFusion(nn.Module):
                 if flow_mag.shape[-2:] != w_map.shape[-2:]:
                     flow_mag = F.interpolate(flow_mag, size=w_map.shape[-2:],
                                              mode='bilinear', align_corners=False)
+                # Normalized motion strength in [0,1], reused by the AOW
+                # regularizer to relax the window cap per pixel. Detached: it is
+                # a conditioning signal only, never a gradient path to the flow.
+                self.current_motion_norm = (
+                    flow_mag / self.motion_window_flow_ref
+                ).clamp(0.0, 1.0).detach()
                 motion_factor = 1.0 + self.motion_window_gain * (
                     flow_mag / self.motion_window_flow_ref
                 )
@@ -995,17 +1006,48 @@ class GaussianFusion(nn.Module):
         return self._temporal_reg_loss
 
     def get_aow_regularization(self):
-        """
-        Mild regularizer pushing the AOW window map towards 1.0, preventing the
-        SIREN window scorer from collapsing onto the maximum window (which would
-        make offsets reach ±10 px immediately).
+        """Regularize the learned AOW window map.
+
+        How much window a region needs depends on how much it moves. Static
+        background wants ~1 (a wider window only lets the offset wander and
+        blurs the result), while a fast moving region wants the full range so
+        the offset can span the real displacement.
+
+        The original (w - 1).abs().mean() cannot express that. w is a softmax
+        mixture over {1..10}, so it is always >= 1 and the abs() never binds:
+        the term is just (w - 1).mean(), a constant pull towards the smallest
+        window that fights large motion head-on.
+
+        Modes:
+            l1           - legacy (w - 1).abs().mean(), kept for ablation.
+            hinge        - relu(w - cap): window is free below a global cap.
+            motion_hinge - relu(w - allowed(motion)), where allowed ramps from
+                1 to cap with the normalized flow magnitude. Static pixels are
+                still pushed to 1, moving ones may open the window as far as
+                they need. This is the default.
         """
         # Regularize the *raw learned* window only; the motion modulation is
         # deterministic and must not be pulled back toward 1 by the loss.
         w_map = getattr(self, 'current_w_map_raw', None)
         if w_map is None:
             return None
-        return (w_map - 1.0).abs().mean()
+
+        if self.aow_penalty == 'l1':
+            return (w_map - 1.0).abs().mean()
+
+        if self.aow_penalty == 'hinge':
+            return torch.relu(w_map - self.aow_window_cap).mean()
+
+        # motion_hinge (default)
+        motion = getattr(self, 'current_motion_norm', None)
+        if motion is None:
+            # No flow available (e.g. first step); fall back to the global cap.
+            return torch.relu(w_map - self.aow_window_cap).mean()
+        if motion.shape[-2:] != w_map.shape[-2:]:
+            motion = F.interpolate(motion, size=w_map.shape[-2:],
+                                   mode='bilinear', align_corners=False)
+        allowed = 1.0 + (self.aow_window_cap - 1.0) * motion
+        return torch.relu(w_map - allowed).mean()
 
     def get_aux_outputs(self):
         """Return latest auxiliary visible/infrared reconstructions (removed)."""

@@ -36,6 +36,10 @@ model:
     motion_window_gain: 4.0     # 光流幅值 -> offset 窗口放大的增益
     motion_window_max: 18.0     # offset 窗口放大上限（大位移需要更大窗口）
     motion_window_flow_ref: 20.0  # 达到该光流幅值时窗口放大 gain 倍
+    # AOW 正则形状：w 是 {1..10} 的 softmax 凸组合，恒 >=1，故旧的 (w-1).abs()
+    # 等价于 (w-1)，是一路把窗口往最小值拖，与大运动需要大窗口直接对抗。
+    aow_penalty: motion_hinge  # l1(旧) | hinge(全局上限) | motion_hinge(逐像素上限)
+    aow_window_cap: 10.0       # 运动最强处允许的窗口上限（= window_bank 最大值）
 
 # Training dataset
 train_dataset:
