@@ -51,6 +51,14 @@ train_dataset:
     scale_max: 1.0
     patch_size: 224            # 256 -> 224 (compression)
     augment: true
+    # 空间采样：M3SVD 帧为 480x640，224 窗口只覆盖 16% 画面，而位移 >10px 的
+    # 像素仅约 3%，均匀随机裁剪绝大多数落在静止背景上，模型很少见到大运动。
+    crop_strategy: hybrid      # random | motion | resize | hybrid
+    motion_crop_prob: 0.80     # 按帧间运动能量挑选裁剪位置的比例
+    resize_crop_prob: 0.10     # 整帧等比缩放（保留完整场景，位移会同比缩小）
+    motion_crop_gamma: 32.0    # 能量加权指数：实测 >10px 像素占比 3.0%->10.1%，
+                               # 每样本最大位移 P50 5.0->16.1；再往上收益 <0.4%
+    motion_crop_downscale: 8   # 能量图降采样倍率（滤除纹理噪声与压缩伪影）
 
 # Training hyperparameters
 batch_size: 24                  # 16 -> 8 (compression for 32GB VRAM)
