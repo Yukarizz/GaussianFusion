@@ -79,7 +79,8 @@ class TemporalCrossAttention(nn.Module):
             nn.Conv2d(n_feats, n_feats + 1, 3, padding=1),
         )
 
-    def forward(self, feat_0, feat_1, flow_01, flow_10, tau, occ_threshold=5.0):
+    def forward(self, feat_0, feat_1, flow_01, flow_10, tau, occ_threshold=5.0,
+                flow_res=None):
         """
         Args:
             feat_0: Features at frame 0 [B, C, H, W].
@@ -88,6 +89,10 @@ class TemporalCrossAttention(nn.Module):
             flow_10: Flow from frame N to frame 0 [B, 2, H, W].
             tau: Temporal position in (0,1). Scalar or Tensor [B].
             occ_threshold: Unused (kept for API compatibility).
+            flow_res: Optional learned residual [B, 4, H, W] correcting the
+                linear-tau displacement: channels 0:2 add to the tau -> frame 0
+                displacement and 2:4 to the tau -> frame N one. None keeps the
+                pure constant-velocity behaviour.
 
         Returns:
             Interpolated features at time tau [B, C, H, W].
@@ -112,6 +117,16 @@ class TemporalCrossAttention(nn.Module):
         # negated before warping an endpoint feature to the intermediate time tau.
         flow_0t = -t * flow_01          # tau -> frame 0
         flow_1t = -(1.0 - t) * flow_10  # tau -> frame N
+
+        # Learned deviation from the constant-velocity assumption. Signed so
+        # that flow_res[:, 0:2] is an additive correction to the magnitude of
+        # the tau -> frame 0 displacement.
+        if flow_res is not None:
+            if flow_res.shape[-2:] != flow_01.shape[-2:]:
+                flow_res = F.interpolate(flow_res, size=flow_01.shape[-2:],
+                                         mode='bilinear', align_corners=True)
+            flow_0t = flow_0t - flow_res[:, 0:2]
+            flow_1t = flow_1t - flow_res[:, 2:4]
 
         # ======================================================
         # 2. Backward warping of endpoint features to time tau

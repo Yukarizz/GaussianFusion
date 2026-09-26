@@ -80,11 +80,69 @@ class MotionAwareWindowScorer(nn.Module):
                 self.conv3.bias.uniform_(-bound_3, bound_3)
 
     def forward(self, feat_0, feat_1):
-        x = torch.cat([feat_0, feat_1], dim=1) 
+        x = torch.cat([feat_0, feat_1], dim=1)
         x = self.sine1(self.conv1(x))
         x = self.sine2(self.conv2(x))
         logits = self.conv3(x)
         return torch.softmax(logits, dim=1)
+
+
+class ResidualFlowHead(nn.Module):
+    """Learned correction to the frozen optical flow.
+
+    The pipeline assumes constant-velocity linear motion: the displacement from
+    the intermediate time back to an endpoint is taken to be just tau * flow,
+
+        flow_0t = -tau * flow_01
+        flow_1t = -(1 - tau) * flow_10
+
+    Real motion is rarely constant-velocity (acceleration, curved paths,
+    occlusion), and the flow network is frozen, so nothing can correct it. This
+    head predicts the deviation from that linear assumption:
+
+        flow_0t = -(tau * flow_01 + delta_0)
+        flow_1t = -((1 - tau) * flow_10 + delta_1)
+
+    The last layer is zero-initialized, so at step 0 the residual is exactly 0
+    and the model is numerically identical to the frozen-flow baseline. That
+    makes it safe to enable on top of an existing checkpoint: it starts as a
+    no-op and only diverges if training finds the correction useful.
+
+    Gradients reach this head through the warping and the Gaussian center
+    displacement; they never reach the frozen flow network.
+    """
+
+    def __init__(self, in_channels, hidden=64, tau_channels=1, max_delta=32.0):
+        super().__init__()
+        # feat_0, feat_N, flow_01, flow_10, tau
+        in_dim = in_channels * 2 + 4 + tau_channels
+        self.net = nn.Sequential(
+            nn.Conv2d(in_dim, hidden, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden, hidden, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden, 4, 3, padding=1),
+        )
+        # Soft saturation on the residual magnitude. The head corrects a
+        # deviation from linear motion, which is bounded in practice, whereas
+        # an unconstrained output can push the warp far outside the image and
+        # blow up early training. tanh keeps small corrections linear (it is
+        # ~identity near 0) while bounding the range to +/- max_delta.
+        self.max_delta = float(max_delta)
+        self._zero_init_last()
+
+    def _zero_init_last(self):
+        last = self.net[-1]
+        nn.init.zeros_(last.weight)
+        if last.bias is not None:
+            nn.init.zeros_(last.bias)
+
+    def forward(self, feat_0, feat_N, flow_01, flow_10, tau_map):
+        x = torch.cat([feat_0, feat_N, flow_01, flow_10, tau_map], dim=1)
+        raw = self.net(x)
+        if self.max_delta and self.max_delta > 0:
+            return self.max_delta * torch.tanh(raw / self.max_delta)
+        return raw
 
 def get_coord(width, height):
     """Generate normalized coordinate grid in [-1, 1]."""
@@ -136,7 +194,10 @@ class GaussianFusion(nn.Module):
                  motion_window_max=10.0,
                  motion_window_flow_ref=20.0,
                  aow_penalty='motion_hinge',
-                 aow_window_cap=10.0):
+                 aow_window_cap=10.0,
+                 residual_flow=False,
+                 residual_flow_hidden=64,
+                 residual_flow_max=32.0):
         super().__init__()
         self.flow_model = flow_model
         self.occ_fusion_enabled = occ_fusion
@@ -151,6 +212,12 @@ class GaussianFusion(nn.Module):
         # AOW regularizer shape, see get_aow_regularization().
         self.aow_penalty = aow_penalty
         self.aow_window_cap = aow_window_cap
+        # Learned correction on top of the frozen flow, see ResidualFlowHead.
+        self.residual_flow = residual_flow
+        if residual_flow:
+            self.flow_residual_head = ResidualFlowHead(
+                in_channels=n_feats, hidden=residual_flow_hidden,
+                max_delta=residual_flow_max)
 
         self.n_feats = n_feats
         # Inference switch: predict color on the full-res F_tau instead of the
@@ -485,17 +552,24 @@ class GaussianFusion(nn.Module):
         conf_1 = torch.exp(-cons_1 / sigma).clamp(conf_floor, 1.0)
         return conf_0, conf_1
 
-    def _apply_flow_motion(self, xyz, flow, tau_weight, ps_h, ps_w):
+    def _apply_flow_motion(self, xyz, flow, tau_weight, ps_h, ps_w, res=None):
         """Displace Gaussian centers by tau-scaled flow (in normalized coords).
 
         xyz is in [-1,1] normalized coords; flow is in pixels. We convert the
         displacement to normalized units using the ps grid resolution.
+
+        `res` is the optional learned correction [B, 2, H, W] added to the
+        tau-scaled displacement, matching ResidualFlowHead's convention.
         """
         flow_flat = self._flow_to_gaussian_grid(flow, ps_h, ps_w)   # [B, N, 2] px
         if not isinstance(tau_weight, torch.Tensor):
             tau_weight = torch.tensor(tau_weight, device=xyz.device, dtype=xyz.dtype)
         tau_weight = tau_weight.to(device=xyz.device, dtype=xyz.dtype).view(-1, 1, 1)
         flow_h, flow_w = flow.shape[2], flow.shape[3]
+        if res is not None:
+            res_flat = self._flow_to_gaussian_grid(res, ps_h, ps_w)
+            flow_flat = tau_weight * flow_flat + res_flat
+            tau_weight = 1.0
         disp_x = 2 * tau_weight * flow_flat[:, :, 0:1] / flow_w
         disp_y = 2 * tau_weight * flow_flat[:, :, 1:2] / flow_h
         return xyz + torch.cat((disp_x, disp_y), dim=2)
@@ -714,7 +788,7 @@ class GaussianFusion(nn.Module):
     @torch.amp.custom_fwd(cast_inputs=torch.float32, device_type='cuda')
     def _render_motion_gaussians(self, feat_fused_0, feat_fused_N, flow_01, flow_10,
                                 scale_h, scale_w, lr_h, lr_w, tau,
-                                feat_fused_tau=None):
+                                feat_fused_tau=None, flow_res=None):
         """
         Paper-aligned Gaussian parameter generation.
 
@@ -728,6 +802,10 @@ class GaussianFusion(nn.Module):
 
         Optical flow was already used to build F_tau; it is NOT applied to xyz here
         (no double motion compensation).
+
+        `flow_res` is the optional learned correction [B, 4, H, W] from
+        ResidualFlowHead; channels 0:2 correct the xyz displacement derived
+        from frame 0 and 2:4 the one from frame N.
         """
         bs = feat_fused_tau.shape[0]
         device = feat_fused_tau.device
@@ -787,8 +865,12 @@ class GaussianFusion(nn.Module):
         if getattr(self, 'flow_driven_xyz', False):
             xyz_base = self._base_xyz(offset_tau, ps_h, ps_w, H, W)
             # Displace from frame-0 and frame-N to time tau.
-            xyz_from_0 = self._apply_flow_motion(xyz_base, flow_01, tau_t, ps_h, ps_w)
-            xyz_from_N = self._apply_flow_motion(xyz_base, flow_10, 1.0 - tau_t, ps_h, ps_w)
+            res_0 = flow_res[:, 0:2] if flow_res is not None else None
+            res_N = flow_res[:, 2:4] if flow_res is not None else None
+            xyz_from_0 = self._apply_flow_motion(xyz_base, flow_01, tau_t, ps_h, ps_w,
+                                                 res=res_0)
+            xyz_from_N = self._apply_flow_motion(xyz_base, flow_10, 1.0 - tau_t, ps_h,
+                                                 ps_w, res=res_N)
             # Forward-backward consistency confidence.
             conf_0, conf_N = self._compute_fb_confidence(flow_01, flow_10)
             conf0_grid = self._confidence_to_gaussian_grid(conf_0, ps_h, ps_w)
@@ -910,6 +992,22 @@ class GaussianFusion(nn.Module):
         feat_fused_0 = self.fusion(feat_vis_0, feat_ir_0)   # F_0
         feat_fused_N = self.fusion(feat_vis_N, feat_ir_N)   # F_N
 
+        # --- Step 4b: residual correction to the frozen optical flow ---
+        # Downstream, motion is treated as constant-velocity linear (displacement
+        # = tau * flow). The flow net is frozen and cannot fix its own error or
+        # the non-linear motion it never modelled, so a small head predicts the
+        # deviation. Zero-initialized, hence a no-op at step 0.
+        flow_res = None
+        if self.residual_flow:
+            B = feat_fused_0.shape[0]
+            tau_t = tau.to(feat_fused_0.dtype).reshape(-1)
+            if tau_t.numel() == 1:
+                tau_t = tau_t.expand(B)
+            tau_map = tau_t.view(B, 1, 1, 1).expand(
+                B, 1, feat_fused_0.shape[2], feat_fused_0.shape[3])
+            flow_res = self.flow_residual_head(
+                feat_fused_0, feat_fused_N, flow_01, flow_10, tau_map)
+
         # --- Step 5: AOW (Motion-Aware Adaptive Offset Window) ---
         # SIREN scores endpoint fused features, yielding a per-pixel window size
         # map W_map. Later offset is scaled: dmu_tau = dmu_tilde ⊙ W_map.
@@ -949,7 +1047,8 @@ class GaussianFusion(nn.Module):
 
         # --- Step 6: CGM on fused endpoint features -> F_tau ---
         feat_fused_tau = self.temporal_attn(
-            feat_fused_0, feat_fused_N, flow_01, flow_10, tau, self.occ_threshold
+            feat_fused_0, feat_fused_N, flow_01, flow_10, tau, self.occ_threshold,
+            flow_res=flow_res
         )
 
         self._temporal_reg_loss = None
@@ -991,7 +1090,7 @@ class GaussianFusion(nn.Module):
             output = self._render_motion_gaussians(
                 feat_fused_0, feat_fused_N, flow_01, flow_10,
                 scale_h, scale_w, lr_h, lr_w, tau=tau,
-                feat_fused_tau=feat_fused_tau
+                feat_fused_tau=feat_fused_tau, flow_res=flow_res
             )
         else:
             # Backward-compatible path: render directly from the CGM feature.

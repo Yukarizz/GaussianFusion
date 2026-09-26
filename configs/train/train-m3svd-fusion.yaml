@@ -40,6 +40,11 @@ model:
     # 等价于 (w-1)，是一路把窗口往最小值拖，与大运动需要大窗口直接对抗。
     aow_penalty: motion_hinge  # l1(旧) | hinge(全局上限) | motion_hinge(逐像素上限)
     aow_window_cap: 10.0       # 运动最强处允许的窗口上限（= window_bank 最大值）
+    # 残差光流：光流网络冻结，且下游按「匀速线性」把位移取为 tau*flow，无人能纠正
+    # 该假设的偏差。小头预测该偏差，最后一层 zero-init，第 0 步等价于原 pipeline。
+    residual_flow: true
+    residual_flow_hidden: 64
+    residual_flow_max: 32.0      # 残差幅度软饱和上限(px)，防止 warp 采样到图外
 
 # Training dataset
 train_dataset:
