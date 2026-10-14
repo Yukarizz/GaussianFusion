@@ -34,7 +34,7 @@ model:
     occ_gamma: 4.0              # 遮挡 mask 陡峭度（越大越接近硬选择）
     occ_gamma_flow_ref: 10.0    # 自适应 gamma 的光流幅值参考（大位移下软化遮挡惩罚）
     motion_window_gain: 4.0     # 光流幅值 -> offset 窗口放大的增益
-    motion_window_max: 18.0     # offset 窗口放大上限（大位移需要更大窗口）
+    motion_window_max: 5     # offset 窗口放大上限（大位移需要更大窗口）
     motion_window_flow_ref: 20.0  # 达到该光流幅值时窗口放大 gain 倍
     # AOW 正则形状：w 是 {1..10} 的 softmax 凸组合，恒 >=1，故旧的 (w-1).abs()
     # 等价于 (w-1)，是一路把窗口往最小值拖，与大运动需要大窗口直接对抗。
@@ -45,6 +45,13 @@ model:
     residual_flow: true
     residual_flow_hidden: 64
     residual_flow_max: 32.0      # 残差幅度软饱和上限(px)，防止 warp 采样到图外
+    # 多尺度共享 offset head（FILM 方案 C，治大尺度运动）：把单次 tanh 回归
+    # 拆成 coarse-to-fine 金字塔逐级累加残差。默认 false 保持 baseline 不变。
+    multiscale_offset: True
+    multiscale_offset_levels: 5     # ps 网格 56x56，最多可下采样到 56/16=3.5px，5 层足够
+    multiscale_offset_specialized: 2  # 最细 2 层各自独立，其余粗层共享同一实例
+    multiscale_offset_hidden: 64
+    multiscale_offset_convs: 3
 
 # Training dataset
 train_dataset:
@@ -54,8 +61,8 @@ train_dataset:
     split: train
     vis_modality: visible_Enhance
     ir_modality: infrared_Enhance
-    n_min: 2                   # 相邻帧插帧 (gap=1: 帧 i 与 i+2, GT 为 i+1, tau=0.5)
-    n_max: 12
+    n_min: 8                   # 相邻帧插帧 (gap=1: 帧 i 与 i+2, GT 为 i+1, tau=0.5)
+    n_max: 8
     scale_min: 1.0
     scale_max: 1.0
     patch_size: 224            # 256 -> 224 (compression)
@@ -86,4 +93,4 @@ lambda_grad: 2.0
 lambda_temporal: 0.0           # CGM 不再产生对抗坍缩正则
 lambda_aux_vis: 1.0            # F_tau -> Vi_tau 重建损失（保留可见光中间内容）
 lambda_aux_ir: 1.0             # F_tau -> IR_tau 重建损失（保留红外热源中间内容）
-lambda_aow: 0.01               # AOW 窗口正则：抑制 SIREN 坍缩到最大窗口
+lambda_aow: 0               # AOW 窗口正则：抑制 SIREN 坍缩到最大窗口

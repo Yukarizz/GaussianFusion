@@ -144,6 +144,101 @@ class ResidualFlowHead(nn.Module):
             return self.max_delta * torch.tanh(raw / self.max_delta)
         return raw
 
+
+class SharedOffsetHead(nn.Module):
+    """FILM-style offset predictor reused across coarse pyramid levels.
+
+    Input: feature + upsampled coarse offset (2ch) + tau (1ch). The last conv
+    has NO activation — FILM explicitly found tanh/sigmoid clipping hurts, so
+    the head outputs a raw residual (in pixel units) rather than a bounded one.
+    """
+
+    def __init__(self, feat_ch, hidden=64, n_convs=3):
+        super().__init__()
+        ch = feat_ch + 2 + 1          # feature + coarse offset (2) + tau (1)
+        layers = []
+        for i in range(n_convs):
+            layers += [nn.Conv2d(ch if i == 0 else hidden, hidden, 3, 1, 1),
+                       nn.LeakyReLU(0.2, inplace=True)]
+            ch = hidden
+        layers.append(nn.Conv2d(hidden, 2, 3, 1, 1))  # last layer: no activation
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, feat, coarse_offset, tau):
+        x = torch.cat([feat, coarse_offset, tau], dim=1)
+        return self.net(x)
+
+
+class MultiScaleOffset(nn.Module):
+    """Coarse-to-fine offset regression (FILM pyramid_flow_estimator).
+
+    A single tanh head must learn small fine motion and large jumps in one shot;
+    FILM instead splits it into L levels: the coarsest predicts the DC motion,
+    each finer level predicts only a small residual, and the coarse offset is
+    upsampled (×2 for the doubled resolution) and accumulated. All coarse levels
+    (>= specialized) share one head instance — the shared_predictor — which is a
+    stability requirement, not just a parameter saving (FILM Table 3: the
+    unshared 64-filter model does not converge).
+
+    Input `feat` is the finest feature [B, C, H, W]; it is avg-pooled into a
+    pyramid internally. Returns the accumulated offset at the finest resolution.
+    """
+
+    def __init__(self, feat_ch, levels=6, specialized=2, n_convs=3, hidden=64):
+        super().__init__()
+        self.levels = levels
+        self.specialized = min(specialized, levels)
+        # Finest `specialized` levels are independent (fine-level semantics differ
+        # most); all coarser levels reuse a single shared instance.
+        self.heads = nn.ModuleList(
+            [SharedOffsetHead(feat_ch, hidden, n_convs) for _ in range(self.specialized)])
+        shared = SharedOffsetHead(feat_ch, hidden, n_convs)
+        for _ in range(self.specialized, levels):
+            self.heads.append(shared)
+
+    def forward(self, feat, tau, fine_modulation=None):
+        # Cap levels by the smallest spatial extent so avg_pool never hits 0.
+        min_ext = min(feat.shape[-2], feat.shape[-1])
+        levels = min(self.levels, max(1, int(math.log2(min_ext)) + 1))
+
+        # Build feature/tau pyramids, finest -> coarsest.
+        feat_pyr = [feat]
+        tau_pyr = [tau]
+        f, t = feat, tau
+        for _ in range(levels - 1):
+            f = F.avg_pool2d(f, 2)
+            t = F.avg_pool2d(t, 2)
+            feat_pyr.append(f)
+            tau_pyr.append(t)
+
+        # Accumulate coarse -> fine. Levels beyond `levels` simply share the
+        # last heads (index clamped), preserving weight-sharing semantics.
+        off = None
+        for li in range(levels - 1, -1, -1):
+            f = feat_pyr[li]
+            t = tau_pyr[li]
+            if off is None:
+                # Coarsest level: the DC term, no incoming coarse offset.
+                coarse = torch.zeros(f.size(0), 2, f.size(2), f.size(3),
+                                     device=f.device, dtype=f.dtype)
+            else:
+                # Upsample the coarse offset and ×2 for the doubled resolution.
+                coarse = F.interpolate(off * 2.0, size=f.shape[-2:],
+                                       mode='bilinear', align_corners=False)
+            head_idx = min(li, len(self.heads) - 1)
+            res = self.heads[head_idx](f, coarse, t)
+            # AOW modulation gates only the finest level's residual: coarse
+            # levels already span the full displacement range, so scaling them
+            # by w_map would over-amplify the accumulated offset.
+            if fine_modulation is not None and li == 0:
+                fm = fine_modulation
+                if fm.shape[-2:] != res.shape[-2:]:
+                    fm = F.interpolate(fm, size=res.shape[-2:], mode='nearest')
+                res = res * fm
+            off = res + coarse
+        return off
+
+
 def get_coord(width, height):
     """Generate normalized coordinate grid in [-1, 1]."""
     x_coords = torch.arange(width)
@@ -197,7 +292,12 @@ class GaussianFusion(nn.Module):
                  aow_window_cap=10.0,
                  residual_flow=False,
                  residual_flow_hidden=64,
-                 residual_flow_max=32.0):
+                 residual_flow_max=32.0,
+                 multiscale_offset=False,
+                 multiscale_offset_levels=5,
+                 multiscale_offset_specialized=2,
+                 multiscale_offset_hidden=64,
+                 multiscale_offset_convs=3):
         super().__init__()
         self.flow_model = flow_model
         self.occ_fusion_enabled = occ_fusion
@@ -219,6 +319,28 @@ class GaussianFusion(nn.Module):
                 in_channels=n_feats, hidden=residual_flow_hidden,
                 max_delta=residual_flow_max)
 
+        # Compressed Gaussian latent: channels after PixelUnshuffle(2). Defined
+        # early because the multi-scale offset head below needs gau_feats.
+        self.gau_feats = 4 * n_feats        # e.g. n_feats=48 -> 192
+        self.cov_dim = 2 * self.gau_feats   # covariance embedding dim (384 for 48)
+
+        # Multi-scale shared offset head (FILM scheme C). Replaces the single
+        # tanh offset regression with a coarse-to-fine accumulation. Disabled by
+        # default so the baseline path is unchanged; enable via config flag.
+        self.multiscale_offset = multiscale_offset
+        if multiscale_offset:
+            # The head operates on the post-PixelUnshuffle Gaussian feature
+            # feat_ps_tau, whose channel dim is gau_feats = 4*n_feats. Its output
+            # is in the same ps-grid pixel units as the original tanh offset, so
+            # it drops straight into _base_xyz without any rescaling.
+            self.multiscale_offset_head = MultiScaleOffset(
+                feat_ch=self.gau_feats,
+                levels=multiscale_offset_levels,
+                specialized=multiscale_offset_specialized,
+                n_convs=multiscale_offset_convs,
+                hidden=multiscale_offset_hidden,
+            )
+
         self.n_feats = n_feats
         # Inference switch: predict color on the full-res F_tau instead of the
         # PixelUnshuffle(2) grid, which loses small moving-object details.
@@ -232,9 +354,6 @@ class GaussianFusion(nn.Module):
         # Runtime flag: set after loading a checkpoint that trained this head,
         # so demo/inference only uses full-res color when the weights exist.
         self.full_res_color_trained = False
-        # Compressed Gaussian latent: channels after PixelUnshuffle(2).
-        self.gau_feats = 4 * n_feats        # e.g. n_feats=48 -> 192
-        self.cov_dim = 2 * self.gau_feats   # covariance embedding dim (384 for 48)
         self.occ_threshold = occ_threshold
         self.gaussian_render_mode = gaussian_render_mode
         self.fb_confidence_scale = fb_confidence_scale or occ_threshold
@@ -856,6 +975,21 @@ class GaussianFusion(nn.Module):
             color_tau = params_tau['color']
             offset_tau = params_tau['offset']
             n_gaussians = params_tau['n_gaussians']
+
+        # ---- Multi-scale shared offset head (FILM scheme C) ----
+        # Override the single-shot tanh offset with a coarse-to-fine pyramid
+        # accumulation on the same Gaussian feature feat_ps_tau, producing a
+        # ps-grid pixel offset like the original head. AOW w_map gates only the
+        # finest level's residual (coarse levels already span the full range).
+        if self.multiscale_offset:
+            tau_ch = tau_t.to(dtype=feat_ps_tau.dtype).view(bs, 1, 1, 1) \
+                .expand(-1, 1, ps_h, ps_w)
+            fine_mod = self.current_w_map if (
+                hasattr(self, 'current_w_map') and self.current_w_map is not None
+            ) else None
+            off_ms = self.multiscale_offset_head(
+                feat_ps_tau, tau_ch, fine_modulation=fine_mod)  # [B,2,ps_h,ps_w] px
+            offset_tau = off_ms.permute(0, 2, 3, 1).reshape(bs, n_gaussians, 2)
 
         # mu_tau = grid + Delta mu_tau (AOW-adjusted offset)
         # Optional flow-driven displacement (motion compensation): move Gaussian
